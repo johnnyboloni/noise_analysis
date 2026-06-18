@@ -32,6 +32,7 @@ SEQUENCE_DIRS = [
 OUTPUT_DIR = "output"
 MAX_FRAMES = None   # int to cap frames per sequence, None = load all
 HIST_BINS  = 512
+RESIDUAL_HIST_RANGE = 0.05   # histogram x-axis spans ±this value after mean sub
 # ============================================================
 
 
@@ -73,32 +74,68 @@ def load_raw_rgb(path: Path) -> np.ndarray:
         return raw.postprocess(use_camera_wb=True, no_auto_bright=False, output_bps=8)
 
 
-def load_sequence(paths: list[Path], verbose: bool = True) -> np.ndarray:
-    """Load all frames as raw Bayer float32; returns (N, H, W)."""
-    frames = []
-    for i, p in enumerate(paths):
-        if verbose:
-            print(f"  [{i+1}/{len(paths)}] {p.name}", end="\r", flush=True)
-        frames.append(load_raw(p))
-    if verbose:
-        print()
-    return np.stack(frames, axis=0)
-
-
-def calibrate(stack: np.ndarray, pattern: np.ndarray,
-              black: np.ndarray, white: float) -> np.ndarray:
+def calibrate_frame(frame: np.ndarray, pattern: np.ndarray,
+                    black: np.ndarray, white: float) -> np.ndarray:
     """
     Subtract per-channel black level and normalize by (white - black).
-    Each Bayer channel gets its own black level value.
-    Returns float32 array nominally in [0, 1]; clipped to that range.
+    Input : (H, W) float32 Bayer frame in ADU.
+    Output: (H, W) float32, nominally [0, 1], clipped.
     """
-    out = np.empty_like(stack, dtype=np.float32)
+    out = np.empty_like(frame, dtype=np.float32)
     for r in range(2):
         for c in range(2):
             ch = int(pattern[r, c])
             bl = black[ch]
-            out[:, r::2, c::2] = (stack[:, r::2, c::2] - bl) / (white - bl)
+            out[r::2, c::2] = (frame[r::2, c::2] - bl) / (white - bl)
     return np.clip(out, 0.0, 1.0)
+
+
+def stream_mean(paths: list[Path], pattern: np.ndarray,
+                black: np.ndarray, white: float) -> np.ndarray:
+    """
+    Pass 1 — load and calibrate frames one at a time, return per-pixel mean.
+    Peak memory: two (H, W) float32 arrays (accumulator + current frame).
+    """
+    accum: np.ndarray | None = None
+    for i, p in enumerate(paths):
+        print(f"  pass 1  [{i+1}/{len(paths)}] {p.name}", end="\r", flush=True)
+        frame = calibrate_frame(load_raw(p), pattern, black, white)
+        if accum is None:
+            accum = frame.astype(np.float64)
+        else:
+            accum += frame
+    print()
+    return (accum / len(paths)).astype(np.float32)
+
+
+def stream_histograms(
+    paths: list[Path],
+    mean: np.ndarray,
+    pattern: np.ndarray,
+    black: np.ndarray,
+    white: float,
+    n_bins: int,
+    residual_half_range: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Pass 2 — accumulate raw and residual histogram counts simultaneously.
+    Returns (raw_counts, raw_edges, res_counts, res_edges).
+    Peak memory: two (H, W) float32 arrays (mean + current frame).
+    """
+    raw_edges = np.linspace(0.0, 1.0, n_bins + 1)
+    res_edges = np.linspace(-residual_half_range, residual_half_range, n_bins + 1)
+    raw_counts = np.zeros(n_bins, dtype=np.int64)
+    res_counts = np.zeros(n_bins, dtype=np.int64)
+
+    for i, p in enumerate(paths):
+        print(f"  pass 2  [{i+1}/{len(paths)}] {p.name}", end="\r", flush=True)
+        frame = calibrate_frame(load_raw(p), pattern, black, white)
+        h, _ = np.histogram(frame, bins=raw_edges)
+        raw_counts += h
+        h, _ = np.histogram(frame - mean, bins=res_edges)
+        res_counts += h
+    print()
+    return raw_counts, raw_edges, res_counts, res_edges
 
 
 def bayer_to_rgb(bayer: np.ndarray, pattern: np.ndarray) -> np.ndarray:
@@ -160,26 +197,19 @@ def plot_mean_frames(rgb_means: list[np.ndarray], labels: list[str], out: Path):
 
 
 def plot_histograms(
-    stacks: list[np.ndarray],
+    hist_data: list[tuple[np.ndarray, np.ndarray]],
     labels: list[str],
     out: Path,
     title: str,
-    n_bins: int = 512,
+    xlabel: str,
 ):
     fig, ax = plt.subplots(figsize=(9, 5))
-    for stack, label, color in zip(stacks, labels, COLORS):
-        ax.hist(
-            stack.ravel(),
-            bins=n_bins,
-            color=color,
-            alpha=ALPHA,
-            label=label,
-            density=True,
-            histtype="stepfilled",
-            linewidth=0.8,
-            edgecolor=color,
-        )
-    ax.set_xlabel("Calibrated pixel value  (ADU − black) / (white − black)", fontsize=10)
+    for (counts, edges), label, color in zip(hist_data, labels, COLORS):
+        width = edges[1] - edges[0]
+        density = counts / (counts.sum() * width)
+        ax.stairs(density, edges, fill=True, color=color, alpha=ALPHA,
+                  label=label, linewidth=0.8)
+    ax.set_xlabel(xlabel, fontsize=10)
     ax.set_ylabel("Density", fontsize=11)
     ax.set_title(title, fontsize=13)
     ax.legend(fontsize=10)
@@ -200,19 +230,18 @@ def main():
 
     labels = [Path(d).name for d in SEQUENCE_DIRS]
 
-    # ------------------------------------------------------------------ #
-    # 1. Load + calibrate frames                                            #
-    # ------------------------------------------------------------------ #
-    all_stacks:     list[np.ndarray] = []
+    all_means:      list[np.ndarray] = []
     all_patterns:   list[np.ndarray] = []
     all_sample_rgb: list[np.ndarray] = []
+    raw_hist_data:  list[tuple[np.ndarray, np.ndarray]] = []
+    res_hist_data:  list[tuple[np.ndarray, np.ndarray]] = []
 
     for i, (d, label) in enumerate(zip(SEQUENCE_DIRS, labels)):
-        print(f"\nLoading sequence {i+1}/{len(SEQUENCE_DIRS)}: {label}")
+        print(f"\nSequence {i+1}/{len(SEQUENCE_DIRS)}: {label}")
         paths = find_dngs(d)
         if MAX_FRAMES:
             paths = paths[:MAX_FRAMES]
-        print(f"  {len(paths)} DNG files found")
+        print(f"  {len(paths)} DNG files")
 
         pattern, black, white = get_raw_metadata(paths[0])
         all_patterns.append(pattern)
@@ -222,48 +251,45 @@ def main():
         print(f"  Loading sample frame (index {mid}) as RGB …")
         all_sample_rgb.append(load_raw_rgb(paths[mid]))
 
-        print(f"  Loading {len(paths)} raw frames …")
-        raw_stack = load_sequence(paths)
-        cal_stack = calibrate(raw_stack, pattern, black, white)
-        all_stacks.append(cal_stack)
-        print(f"  Stack shape: {cal_stack.shape}  value range: "
-              f"[{cal_stack.min():.4f}, {cal_stack.max():.4f}]")
+        # ---- Pass 1: compute mean (one frame in memory at a time) ----------
+        print(f"  Pass 1/{len(paths)} frames — accumulating mean …")
+        mean = stream_mean(paths, pattern, black, white)
+        all_means.append(mean)
+        print(f"  Mean range: [{mean.min():.4f}, {mean.max():.4f}]")
+
+        # ---- Pass 2: accumulate raw + residual histograms -------------------
+        print(f"  Pass 2/{len(paths)} frames — accumulating histograms …")
+        rc, re, sc, se = stream_histograms(
+            paths, mean, pattern, black, white,
+            HIST_BINS, RESIDUAL_HIST_RANGE,
+        )
+        raw_hist_data.append((rc, re))
+        res_hist_data.append((sc, se))
 
     # ------------------------------------------------------------------ #
-    # 2. Sample frames (RGB via rawpy postprocess)                          #
+    # Plots                                                                 #
     # ------------------------------------------------------------------ #
     print("\nPlotting sample frames …")
     plot_sample_frames(all_sample_rgb, labels, out_dir / "sample_frames.png")
 
-    # ------------------------------------------------------------------ #
-    # 3. Mean frames (Bayer mean → half-res RGB)                            #
-    # ------------------------------------------------------------------ #
-    print("Computing mean frames …")
-    means    = [s.mean(axis=0) for s in all_stacks]
-    mean_rgb = [bayer_to_rgb(m, p) for m, p in zip(means, all_patterns)]
+    print("Plotting mean frames …")
+    mean_rgb = [bayer_to_rgb(m, p) for m, p in zip(all_means, all_patterns)]
     plot_mean_frames(mean_rgb, labels, out_dir / "mean_frames.png")
 
-    # ------------------------------------------------------------------ #
-    # 4. Histograms of calibrated stacks                                    #
-    # ------------------------------------------------------------------ #
     print("Plotting calibrated histograms …")
     plot_histograms(
-        all_stacks, labels,
+        raw_hist_data, labels,
         out_dir / "histograms_raw.png",
         title="Pixel-value histograms — calibrated frames (all frames)",
-        n_bins=HIST_BINS,
+        xlabel="Calibrated value  (ADU − black) / (white − black)",
     )
 
-    # ------------------------------------------------------------------ #
-    # 5. Histograms after mean subtraction                                  #
-    # ------------------------------------------------------------------ #
-    print("Plotting residual histograms (mean-subtracted) …")
-    residuals = [s - m[np.newaxis, :, :] for s, m in zip(all_stacks, means)]
+    print("Plotting residual histograms …")
     plot_histograms(
-        residuals, labels,
+        res_hist_data, labels,
         out_dir / "histograms_residual.png",
         title="Pixel-value histograms — residuals (frames − mean frame)",
-        n_bins=HIST_BINS,
+        xlabel=f"Residual  [range ±{RESIDUAL_HIST_RANGE}]",
     )
 
     print(f"\nDone. All plots saved to: {out_dir.resolve()}")

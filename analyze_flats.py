@@ -24,10 +24,11 @@ import rawpy
 # ============================================================
 # CONFIG — edit paths and options here
 # ============================================================
+seqs_root = '/stage/algo-datasets/DB/DeepISP/MotionCam_RawVideos/S23+_lowlight_uniform/'
 SEQUENCE_DIRS = [
-    "/path/to/seq1",
-    "/path/to/seq2",
-    "/path/to/seq3",
+    seqs_root + '260518_085011_VIDEO_24mm',
+    seqs_root + '260518_085327_VIDEO_24mm',
+    seqs_root + '260518_090426_VIDEO_24mm',
 ]
 OUTPUT_DIR = "output"
 MAX_FRAMES = None   # int to cap frames per sequence, None = load all

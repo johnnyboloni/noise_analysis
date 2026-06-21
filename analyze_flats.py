@@ -252,7 +252,16 @@ def _try_load_cache(npz_path: Path, memmap_path: Path):
     result = {k: data[k] for k in data.files}
     result['frame_shape'] = tuple(int(x) for x in result['frame_shape'])
     if memmap_path.exists():
-        result['residuals_mm'] = np.load(str(memmap_path), mmap_mode='r')
+        mm = np.load(str(memmap_path), mmap_mode='r')
+        # Spot-check: if the first few frames are all zeros the file was never properly
+        # written (e.g. a previous crash before flush).  Treat it as missing so the
+        # next run regenerates it.
+        n_check = min(3, mm.shape[0]) if mm.ndim == 3 else 0
+        if n_check > 0 and not np.any(mm[:n_check]):
+            print(f"  [cache] residuals file looks empty — will regenerate: {memmap_path.name}")
+            result['residuals_mm'] = None
+        else:
+            result['residuals_mm'] = mm
     else:
         result['residuals_mm'] = None
     return result
@@ -368,6 +377,8 @@ def stream_pass2(
             power_accum += fft_power
 
     print()
+    if residuals_mm is not None:
+        residuals_mm.flush()   # ensure writes reach disk before the file is reused as cache
     avg_power = power_accum / len(paths)
     var_frame = (var_accum / len(paths)).astype(np.float32)
     return (cal_counts, cal_edges, res_counts, res_edges,
@@ -406,6 +417,12 @@ def compute_temporal_autocorr(residuals_mm: np.ndarray, max_lag: int) -> np.ndar
     for t in range(N):
         var0 += float(np.sum(residuals_mm[t].astype(np.float64) ** 2))
     var0 /= N * pixel_count
+
+    if var0 == 0.0:
+        print(f"\n  WARNING: residuals are all zero "
+              f"(shape={residuals_mm.shape}, dtype={residuals_mm.dtype}). "
+              f"Delete {CACHE_DIR!r} and re-run to regenerate.")
+        return np.full(max_lag + 1, np.nan)
 
     acf = np.ones(max_lag + 1)
     for k in range(1, min(max_lag + 1, N)):

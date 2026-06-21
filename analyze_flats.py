@@ -37,10 +37,16 @@ except ImportError:
 # CONFIG — edit paths and options here
 # ============================================================
 seqs_root = '/stage/algo-datasets/DB/DeepISP/MotionCam_RawVideos/S23+_lowlight_uniform/'
+
+# GN3v4 note: sequence names ending in '1' are 10-bit; ending in '0' are 12-bit.
+# white_level is read per-file from DNG metadata so calibration adapts automatically.
+gn3_root = '/stage/algo-datasets/DB/LME/raw/20250126_GN3v4_train'
+
 SEQUENCE_DIRS = [
     seqs_root + '260518_085011_VIDEO_24mm',
     seqs_root + '260518_085327_VIDEO_24mm',
     seqs_root + '260518_090426_VIDEO_24mm',
+    gn3_root,
 ]
 OUTPUT_DIR          = "output"
 MAX_FRAMES          = None   # int to cap frames per sequence, None = load all

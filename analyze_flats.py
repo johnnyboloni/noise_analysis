@@ -1,5 +1,5 @@
 """
-Flat frame noise analysis for DNG sequences.
+Flat frame noise analysis for DNG and GN3 raw sequences.
 
 Edit the CONFIG block below, then run:
     python analyze_flats.py
@@ -15,6 +15,7 @@ Outputs (saved to OUTPUT_DIR):
   - temporal_correlation.png : temporal noise autocorrelation function
 """
 
+import json
 import sys
 import hashlib
 from pathlib import Path
@@ -38,15 +39,24 @@ except ImportError:
 # ============================================================
 seqs_root = '/stage/algo-datasets/DB/DeepISP/MotionCam_RawVideos/S23+_lowlight_uniform/'
 
-# GN3v4 note: sequence names ending in '1' are 10-bit; ending in '0' are 12-bit.
-# white_level is read per-file from DNG metadata so calibration adapts automatically.
+# GN3v4: sequence names ending '0' = 12-bit, ending '1' = 10-bit.
+# white_level is derived from imageType in the .imgprops sidecar per frame.
+# Black level is not in the metadata; 256 matches observed sensor floor.
 gn3_root = '/stage/algo-datasets/DB/LME/raw/20250126_GN3v4_train'
+GN3_BLACK_LEVEL = 256
 
 SEQUENCE_DIRS = [
     seqs_root + '260518_085011_VIDEO_24mm',
     seqs_root + '260518_085327_VIDEO_24mm',
     seqs_root + '260518_090426_VIDEO_24mm',
-    gn3_root,
+    gn3_root + '/0240_GN3',
+    gn3_root + '/0241_GN3',
+    gn3_root + '/0250_GN3',
+    gn3_root + '/0251_GN3',
+    gn3_root + '/0260_GN3',
+    gn3_root + '/0261_GN3',
+    gn3_root + '/0270_GN3',
+    gn3_root + '/0271_GN3',
 ]
 OUTPUT_DIR          = "output"
 MAX_FRAMES          = None   # int to cap frames per sequence, None = load all
@@ -55,18 +65,20 @@ RESIDUAL_HIST_RANGE = 0.05   # ± half-range for residual histogram x-axis
 AUTOCORR_LAGS       = 32     # display ± this many pixels in autocorrelation plots
 MAX_TEMPORAL_LAGS   = 10     # number of frame lags for temporal autocorrelation
 CACHE_DIR           = "cache"  # directory for intermediate results; None to disable
+
+# Set True to process only QUICK_TEST_FRAMES frames per sequence — fast sanity check
+QUICK_TEST        = False
+QUICK_TEST_FRAMES = 5
 # ============================================================
 
 
 # --------------------------------------------------------------------------- #
-# I/O helpers                                                                   #
+# DNG I/O helpers                                                               #
 # --------------------------------------------------------------------------- #
 
 def find_dngs(directory: str) -> list[Path]:
     p = Path(directory)
     dngs = sorted(p.glob("*.dng")) + sorted(p.glob("*.DNG"))
-    if not dngs:
-        sys.exit(f"No DNG files found in {directory}")
     return dngs
 
 
@@ -96,6 +108,72 @@ def load_raw_rgb(path: Path) -> np.ndarray:
         return raw.postprocess(use_camera_wb=True, no_auto_bright=False, output_bps=8)
 
 
+# --------------------------------------------------------------------------- #
+# GN3 .raw I/O helpers                                                          #
+# --------------------------------------------------------------------------- #
+
+# Maps bayerOrder string → 2×2 pattern array (0=R 1=G 2=B 3=G2)
+_BAYER_ORDER_TO_PATTERN: dict[str, np.ndarray] = {
+    'RGGB': np.array([[0, 1], [3, 2]], dtype=np.int32),
+    'GRBG': np.array([[1, 0], [2, 3]], dtype=np.int32),
+    'BGGR': np.array([[2, 3], [1, 0]], dtype=np.int32),
+    'GBRG': np.array([[1, 2], [0, 3]], dtype=np.int32),
+}
+
+
+def find_raws(directory: str) -> list[Path]:
+    p = Path(directory)
+    return sorted(p.glob("*.raw"))
+
+
+def get_raw_metadata_gn3(path: Path) -> tuple[np.ndarray, np.ndarray, float]:
+    """
+    Read GN3 .imgprops sidecar JSON (same stem as .raw file).
+    Returns (bayer_pattern, black_level_per_channel, white_level).
+    white_level is derived from imageType (BAYER10 → 1023, BAYER12 → 4095, etc.).
+    black_level is uniform across channels (GN3_BLACK_LEVEL config value).
+    """
+    sidecar = path.with_suffix('.imgprops')
+    meta = json.loads(sidecar.read_text())
+    pattern = _BAYER_ORDER_TO_PATTERN[meta['bayerOrder']]
+    bit_depth = int(''.join(c for c in meta['imageType'] if c.isdigit()))
+    white = float((1 << bit_depth) - 1)
+    black = np.full(4, GN3_BLACK_LEVEL, dtype=np.float32)
+    return pattern, black, white
+
+
+def load_raw_gn3(path: Path, shape: tuple[int, int]) -> np.ndarray:
+    """Load a GN3 .raw file (uint16 LE, no header) and return float32 (H, W)."""
+    return np.frombuffer(path.read_bytes(), dtype='<u2').reshape(shape).astype(np.float32)
+
+
+def load_raw_rgb_gn3(path: Path, shape: tuple[int, int],
+                     pattern: np.ndarray, black: np.ndarray, white: float) -> np.ndarray:
+    """Load, calibrate, and demosaic a GN3 frame for display; returns H×W×3 uint8."""
+    raw = load_raw_gn3(path, shape)
+    cal = calibrate_frame(raw, pattern, black, white)
+    rgb_f = demosaic_to_rgb(cal, pattern)
+    return (rgb_f * 255).astype(np.uint8)
+
+
+# --------------------------------------------------------------------------- #
+# Format detection                                                               #
+# --------------------------------------------------------------------------- #
+
+def _detect_format(directory: str) -> str:
+    """Return 'dng' or 'raw' based on which files are present."""
+    p = Path(directory)
+    if find_dngs(directory):
+        return 'dng'
+    if find_raws(directory):
+        return 'raw'
+    sys.exit(f"No recognized files (.dng / .raw) in {directory}")
+
+
+# --------------------------------------------------------------------------- #
+# Calibration + demosaicing                                                     #
+# --------------------------------------------------------------------------- #
+
 def calibrate_frame(frame: np.ndarray, pattern: np.ndarray,
                     black: np.ndarray, white: float) -> np.ndarray:
     """
@@ -111,10 +189,6 @@ def calibrate_frame(frame: np.ndarray, pattern: np.ndarray,
             out[r::2, c::2] = (frame[r::2, c::2] - bl) / (white - bl)
     return np.clip(out, 0.0, 1.0)
 
-
-# --------------------------------------------------------------------------- #
-# Demosaicing                                                                   #
-# --------------------------------------------------------------------------- #
 
 def _cv2_bayer_code(pattern: np.ndarray) -> int:
     """Map rawpy 2×2 Bayer pattern to cv2 VNG demosaic code."""
@@ -199,14 +273,14 @@ def stream_pass1(
     black: np.ndarray,
     white: float,
     n_bins: int,
+    loader,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Single streaming pass that simultaneously:
+    Single streaming pass:
       - accumulates the per-pixel calibrated mean
       - builds the raw ADU histogram (before calibration)
 
     Returns (mean float32, adu_counts int64, adu_edges float64).
-    Peak extra memory: one (H, W) float64 accumulator + one float32 frame.
     """
     adu_edges  = np.linspace(0.0, white + 1, n_bins + 1)
     adu_counts = np.zeros(n_bins, dtype=np.int64)
@@ -214,7 +288,7 @@ def stream_pass1(
 
     for i, p in enumerate(paths):
         print(f"  pass 1  [{i+1}/{len(paths)}] {p.name}", end="\r", flush=True)
-        raw = load_raw(p)
+        raw = loader(p)
         h, _ = np.histogram(raw, bins=adu_edges)
         adu_counts += h
         cal = calibrate_frame(raw, pattern, black, white)
@@ -236,10 +310,11 @@ def stream_pass2(
     white: float,
     n_bins: int,
     res_half_range: float,
+    loader,
     memmap_path: Path | None = None,
 ) -> tuple:
     """
-    Single streaming pass that simultaneously:
+    Single streaming pass:
       - builds the calibrated-value histogram
       - builds the residual histogram (frame − mean)
       - accumulates the FFT power spectrum for autocorrelation
@@ -260,7 +335,7 @@ def stream_pass2(
 
     for i, p in enumerate(paths):
         print(f"  pass 2  [{i+1}/{len(paths)}] {p.name}", end="\r", flush=True)
-        cal = calibrate_frame(load_raw(p), pattern, black, white)
+        cal = calibrate_frame(loader(p), pattern, black, white)
 
         h, _ = np.histogram(cal, bins=cal_edges)
         cal_counts += h
@@ -269,14 +344,12 @@ def stream_pass2(
         h, _ = np.histogram(residual, bins=res_edges)
         res_counts += h
 
-        # Per-pixel temporal variance accumulation
         res_f64 = residual.astype(np.float64)
         if var_accum is None:
             var_accum = res_f64 ** 2
         else:
             var_accum += res_f64 ** 2
 
-        # Save residuals to memmap for temporal correlation
         if memmap_path is not None:
             if residuals_mm is None:
                 H, W = residual.shape
@@ -286,7 +359,6 @@ def stream_pass2(
                 )
             residuals_mm[i] = residual
 
-        # Subtract frame mean to ensure zero DC before FFT
         residual -= residual.mean()
         fft_power = np.abs(np.fft.rfft2(residual)) ** 2
         if power_accum is None:
@@ -309,16 +381,15 @@ def compute_autocorr(avg_power: np.ndarray, frame_shape: tuple,
     Returns a (2*lags+1) × (2*lags+1) array, value = 1 at zero lag.
     The zero-lag pixel is set to NaN so the colorbar is scaled by off-center values.
     """
-    full = np.fft.irfft2(avg_power, s=frame_shape)   # circular autocorrelation
-    centered = np.fft.fftshift(full)                  # zero lag at centre
+    full = np.fft.irfft2(avg_power, s=frame_shape)
+    centered = np.fft.fftshift(full)
     H, W = centered.shape
     cy, cx = H // 2, W // 2
     norm = centered[cy, cx]
     normalized = centered / max(norm, 1e-12)
     crop = normalized[cy - lags : cy + lags + 1,
                       cx - lags : cx + lags + 1].copy()
-    mid = lags
-    crop[mid, mid] = np.nan   # hide trivial self-correlation peak
+    crop[lags, lags] = np.nan
     return crop
 
 
@@ -357,7 +428,8 @@ def compute_temporal_autocorr(residuals_mm: np.ndarray, max_lag: int) -> np.ndar
 # Plotting                                                                      #
 # --------------------------------------------------------------------------- #
 
-COLORS = ["steelblue", "tomato", "mediumseagreen"]
+# tab10 palette — 10 distinct colors, enough for all sequences
+COLORS = list(plt.cm.tab10.colors)
 ALPHA  = 0.55
 
 
@@ -368,9 +440,9 @@ def plot_sample_frames(rgb_frames: list[np.ndarray], labels: list[str], out: Pat
         axes = [axes]
     for ax, rgb, label in zip(axes, rgb_frames, labels):
         ax.imshow(rgb, aspect="auto")
-        ax.set_title(f"{label}\n(sample frame)", fontsize=11)
+        ax.set_title(f"{label}\n(sample frame)", fontsize=9)
         ax.axis("off")
-    fig.suptitle("Sample frames (rawpy demosaiced RGB)", fontsize=13, y=1.01)
+    fig.suptitle("Sample frames (demosaiced RGB)", fontsize=13, y=1.01)
     fig.tight_layout()
     fig.savefig(out, dpi=150, bbox_inches="tight")
     plt.close(fig)
@@ -385,7 +457,7 @@ def plot_mean_frames(rgb_means: list[np.ndarray], labels: list[str], out: Path):
         axes = [axes]
     for ax, rgb, label in zip(axes, rgb_means, labels):
         ax.imshow(rgb, aspect="auto")
-        ax.set_title(f"{label}\n(mean frame)", fontsize=11)
+        ax.set_title(f"{label}\n(mean frame)", fontsize=9)
         ax.axis("off")
     fig.suptitle(f"Per-pixel mean frames ({method}, per-channel stretched)",
                  fontsize=13, y=1.01)
@@ -403,15 +475,15 @@ def plot_histograms(
     xlabel: str,
 ):
     fig, ax = plt.subplots(figsize=(9, 5))
-    for (counts, edges), label, color in zip(hist_data, labels, COLORS):
+    for i, ((counts, edges), label) in enumerate(zip(hist_data, labels)):
         width = edges[1] - edges[0]
         density = counts / (counts.sum() * width)
-        ax.stairs(density, edges, fill=True, color=color, alpha=ALPHA,
-                  label=label, linewidth=0.8)
+        ax.stairs(density, edges, fill=True, color=COLORS[i % len(COLORS)],
+                  alpha=ALPHA, label=label, linewidth=0.8)
     ax.set_xlabel(xlabel, fontsize=10)
     ax.set_ylabel("Density", fontsize=11)
     ax.set_title(title, fontsize=13)
-    ax.legend(fontsize=10)
+    ax.legend(fontsize=8)
     ax.grid(True, alpha=0.3, linestyle="--")
     fig.tight_layout()
     fig.savefig(out, dpi=150)
@@ -431,7 +503,6 @@ def plot_autocorrelations(
     if n == 1:
         axes = [axes]
 
-    # Scale colorbar to the largest off-center absolute value across all sequences
     vmax = max(np.nanmax(np.abs(a)) for a in autocorrs)
     vmax = max(vmax, 1e-6)
 
@@ -440,7 +511,7 @@ def plot_autocorrelations(
         im = ax.imshow(autocorr, extent=extent, cmap="RdBu_r",
                        vmin=-vmax, vmax=vmax, aspect="equal",
                        origin="lower", interpolation="nearest")
-        ax.set_title(label, fontsize=10)
+        ax.set_title(label, fontsize=9)
         ax.set_xlabel("lag x (px)", fontsize=9)
         ax.set_ylabel("lag y (px)", fontsize=9)
         ax.axhline(0, color="k", linewidth=0.5, alpha=0.4)
@@ -466,10 +537,6 @@ def plot_variance_vs_mean(
     labels: list[str],
     out: Path,
 ):
-    """
-    Hexbin scatter of per-pixel temporal variance vs per-pixel mean.
-    For Poisson shot noise: variance = mean / K  (K = white − black in ADU).
-    """
     n = len(var_frames)
     fig, axes = plt.subplots(1, n, figsize=(5 * n, 5))
     if n == 1:
@@ -483,7 +550,6 @@ def plot_variance_vs_mean(
                        cmap="viridis", bins="log", linewidths=0.2)
         fig.colorbar(hb, ax=ax, label="pixel count (log)")
 
-        # Best-fit slope through origin: var = alpha * mean  (Poisson: alpha = 1/K)
         alpha = float(np.dot(mean_vals, var_vals) / np.dot(mean_vals, mean_vals))
         x = np.array([mean_vals.min(), mean_vals.max()])
         ax.plot(x, alpha * x, "r--", linewidth=1.5,
@@ -491,7 +557,7 @@ def plot_variance_vs_mean(
 
         ax.set_xlabel("Per-pixel mean (calibrated)", fontsize=9)
         ax.set_ylabel("Per-pixel temporal variance", fontsize=9)
-        ax.set_title(label, fontsize=10)
+        ax.set_title(label, fontsize=9)
         ax.legend(fontsize=8)
 
     fig.suptitle(
@@ -513,8 +579,9 @@ def plot_temporal_autocorr(
 ):
     lags = np.arange(max_lag + 1)
     fig, ax = plt.subplots(figsize=(8, 4))
-    for acf, label, color in zip(temporal_acfs, labels, COLORS):
-        ax.plot(lags, acf, "o-", color=color, label=label, markersize=5, linewidth=1.5)
+    for i, (acf, label) in enumerate(zip(temporal_acfs, labels)):
+        ax.plot(lags, acf, "o-", color=COLORS[i % len(COLORS)],
+                label=label, markersize=5, linewidth=1.5)
     ax.axhline(0, color="k", linewidth=0.8, linestyle="--", alpha=0.5)
     ax.set_xlabel("Temporal lag (frames)", fontsize=10)
     ax.set_ylabel("Normalized correlation", fontsize=10)
@@ -523,7 +590,7 @@ def plot_temporal_autocorr(
         "(0 = independent frames, expected for Poisson shot noise)",
         fontsize=12,
     )
-    ax.legend(fontsize=10)
+    ax.legend(fontsize=8)
     ax.grid(True, alpha=0.3, linestyle="--")
     fig.tight_layout()
     fig.savefig(out, dpi=150)
@@ -543,37 +610,65 @@ def main():
     if cache_dir:
         cache_dir.mkdir(parents=True, exist_ok=True)
 
+    # QUICK_TEST overrides MAX_FRAMES for a fast end-to-end sanity check
+    effective_max_frames = QUICK_TEST_FRAMES if QUICK_TEST else MAX_FRAMES
+    if QUICK_TEST:
+        print(f"*** QUICK_TEST mode: capping each sequence to {QUICK_TEST_FRAMES} frames ***\n")
+
     labels = [Path(d).name for d in SEQUENCE_DIRS]
 
     all_means:      list[np.ndarray] = []
     all_var_frames: list[np.ndarray] = []
     all_patterns:   list[np.ndarray] = []
     all_sample_rgb: list[np.ndarray] = []
-    adu_hist_data:  list[tuple[np.ndarray, np.ndarray]] = []
-    cal_hist_data:  list[tuple[np.ndarray, np.ndarray]] = []
-    res_hist_data:  list[tuple[np.ndarray, np.ndarray]] = []
+    adu_hist_data:  list[tuple] = []
+    cal_hist_data:  list[tuple] = []
+    res_hist_data:  list[tuple] = []
     autocorrs:      list[np.ndarray] = []
     temporal_acfs:  list[np.ndarray] = []
 
     for i, (d, label) in enumerate(zip(SEQUENCE_DIRS, labels)):
         print(f"\nSequence {i+1}/{len(SEQUENCE_DIRS)}: {label}")
-        paths = find_dngs(d)
-        if MAX_FRAMES:
-            paths = paths[:MAX_FRAMES]
-        print(f"  {len(paths)} DNG files")
+
+        fmt = _detect_format(d)
+
+        if fmt == 'dng':
+            paths = find_dngs(d)
+        else:
+            paths = find_raws(d)
+
+        if not paths:
+            print(f"  WARNING: no files found, skipping")
+            continue
+
+        if effective_max_frames:
+            paths = paths[:effective_max_frames]
+        print(f"  {len(paths)} {fmt.upper()} files")
 
         seq_name = Path(d).name
         npz_path = memmap_path = None
         cached = None
         if cache_dir:
-            key = _seq_cache_key(paths, MAX_FRAMES)
+            key = _seq_cache_key(paths, effective_max_frames)
             npz_path, memmap_path = _cache_paths(cache_dir, seq_name, key)
             cached = _try_load_cache(npz_path, memmap_path)
 
-        # Always load a sample RGB frame (single DNG, fast)
-        mid = len(paths) // 2
-        print(f"  Loading sample frame (index {mid}) as RGB …")
-        all_sample_rgb.append(load_raw_rgb(paths[mid]))
+        # Set up format-specific loader and get metadata from first file
+        if fmt == 'dng':
+            pattern, black, white = get_raw_metadata(paths[0])
+            loader = load_raw
+            sample_rgb = load_raw_rgb(paths[len(paths) // 2])
+        else:
+            pattern, black, white = get_raw_metadata_gn3(paths[0])
+            meta = json.loads(paths[0].with_suffix('.imgprops').read_text())
+            shape = (meta['height'], meta['width'])
+            loader = lambda p, _s=shape: load_raw_gn3(p, _s)
+            sample_rgb = load_raw_rgb_gn3(
+                paths[len(paths) // 2], shape, pattern, black, white
+            )
+
+        print(f"  Black levels (R,G,G2,B): {black}  |  White level: {white}")
+        all_sample_rgb.append(sample_rgb)
 
         if cached:
             print(f"  [cache hit] {npz_path.name}")
@@ -592,22 +687,17 @@ def main():
             white        = float(cached['white'])
             residuals_mm = cached.get('residuals_mm')
         else:
-            pattern, black, white = get_raw_metadata(paths[0])
-            print(f"  Black levels (R,G,G,B): {black}  |  White level: {white}")
-
-            # Pass 1: mean + ADU histogram
             print(f"  Pass 1 — mean + ADU histogram …")
             mean, adu_counts, adu_edges = stream_pass1(
-                paths, pattern, black, white, HIST_BINS,
+                paths, pattern, black, white, HIST_BINS, loader,
             )
             print(f"  Mean calibrated range: [{mean.min():.4f}, {mean.max():.4f}]")
 
-            # Pass 2: calibrated hist + residuals + autocorrelation + variance
             print(f"  Pass 2 — calibrated hist + residuals + autocorrelation + variance …")
             (cal_counts, cal_edges, res_counts, res_edges,
              avg_power, frame_shape, var_frame, residuals_mm) = stream_pass2(
                 paths, mean, pattern, black, white,
-                HIST_BINS, RESIDUAL_HIST_RANGE,
+                HIST_BINS, RESIDUAL_HIST_RANGE, loader,
                 memmap_path=memmap_path,
             )
 
@@ -642,6 +732,9 @@ def main():
             temporal_acfs.append(
                 compute_temporal_autocorr(residuals_mm, MAX_TEMPORAL_LAGS)
             )
+
+    if not all_means:
+        sys.exit("No sequences processed.")
 
     # ------------------------------------------------------------------ #
     # Plots                                                                 #

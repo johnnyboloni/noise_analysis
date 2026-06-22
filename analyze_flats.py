@@ -6,7 +6,7 @@ Edit the CONFIG block below, then run:
 
 Outputs (saved to OUTPUT_DIR):
   - sample_frames.png        : one representative RGB frame per sequence
-  - mean_frames.png          : per-pixel mean frame (full-res, VNG demosaiced)
+  - mean_and_variance_frames.png : per-pixel mean (RGB) and temporal variance (heatmap)
   - histograms_adu.png       : raw ADU histograms (before any calibration)
   - histograms_cal.png       : calibrated [0,1] histograms
   - histograms_residual.png  : histograms after mean subtraction
@@ -491,15 +491,48 @@ def plot_sample_frames(rgb_frames: list[np.ndarray], labels: list[str], out: Pat
     print(f"Saved {out}")
 
 
-def plot_mean_frames(rgb_means: list[np.ndarray], labels: list[str], out: Path):
+def plot_mean_and_variance_frames(
+    rgb_means: list[np.ndarray],
+    var_frames: list[np.ndarray],
+    labels: list[str],
+    out: Path,
+    max_cols: int = 4,
+):
+    """Two rows per column group: top = demosaiced mean, bottom = variance heatmap."""
     method = "VNG demosaic" if _HAS_CV2 else "half-res channel extraction"
-    n = len(rgb_means)
-    fig, axes = _make_grid_axes(n, panel_w=6, panel_h=5)
-    for ax, rgb, label in zip(axes, rgb_means, labels):
-        ax.imshow(rgb, aspect="auto")
-        ax.set_title(f"{label}\n(mean frame)", fontsize=9)
-        ax.axis("off")
-    fig.suptitle(f"Per-pixel mean frames ({method}, per-channel stretched)", fontsize=13)
+    n = len(labels)
+    ncols = min(n, max_cols)
+    n_groups = math.ceil(n / ncols)
+    nrows = 2 * n_groups   # mean row + variance row per group
+
+    fig, axes = plt.subplots(nrows, ncols,
+                             figsize=(6 * ncols, 5 * nrows),
+                             squeeze=False)
+    for ax in axes.ravel():
+        ax.set_visible(False)
+
+    for i, (rgb, var, label) in enumerate(zip(rgb_means, var_frames, labels)):
+        grp, col = divmod(i, ncols)
+        mean_row = grp * 2
+        var_row  = grp * 2 + 1
+
+        ax_m = axes[mean_row, col]
+        ax_m.set_visible(True)
+        ax_m.imshow(rgb, aspect="auto")
+        ax_m.set_title(f"{label}\n(mean)", fontsize=9)
+        ax_m.axis("off")
+
+        ax_v = axes[var_row, col]
+        ax_v.set_visible(True)
+        im = ax_v.imshow(var, cmap="hot", aspect="auto")
+        ax_v.set_title(f"{label}\n(temporal variance)", fontsize=9)
+        ax_v.axis("off")
+        fig.colorbar(im, ax=ax_v, fraction=0.046, pad=0.04, label="variance")
+
+    fig.suptitle(
+        f"Per-pixel mean ({method}, stretched) and temporal variance",
+        fontsize=13,
+    )
     fig.tight_layout()
     fig.savefig(out, dpi=DPI, bbox_inches="tight")
     plt.close(fig)
@@ -733,7 +766,17 @@ def _process_sequence(d: str, label: str, effective_max_frames, cache_dir: Path 
         pattern      = cached['pattern']
         black        = cached['black']
         white        = float(cached['white'])
-        residuals_mm = cached.get('residuals_mm')
+        # temporal_acf stored as array in cache; all-NaN means it wasn't computed
+        _tacf = cached.get('temporal_acf')
+        if _tacf is not None and not np.all(np.isnan(_tacf)):
+            temporal_acf = _tacf
+        else:
+            # Old cache without temporal_acf — try memmap fallback then give up
+            temporal_acf = None
+            residuals_mm = cached.get('residuals_mm')
+            if residuals_mm is not None and MAX_TEMPORAL_LAGS > 0:
+                print(f"  Computing temporal autocorrelation (max lag {MAX_TEMPORAL_LAGS}) …")
+                temporal_acf = compute_temporal_autocorr(residuals_mm, MAX_TEMPORAL_LAGS)
     else:
         print(f"  Pass 1 — mean + ADU histogram …")
         mean, adu_counts, adu_edges = stream_pass1(
@@ -749,7 +792,13 @@ def _process_sequence(d: str, label: str, effective_max_frames, cache_dir: Path 
             memmap_path=memmap_path,
         )
 
+        temporal_acf = None
+        if residuals_mm is not None and MAX_TEMPORAL_LAGS > 0:
+            print(f"  Computing temporal autocorrelation (max lag {MAX_TEMPORAL_LAGS}) …")
+            temporal_acf = compute_temporal_autocorr(residuals_mm, MAX_TEMPORAL_LAGS)
+
         if cache_dir and npz_path:
+            _tacf_save = temporal_acf if temporal_acf is not None else np.full(MAX_TEMPORAL_LAGS + 1, np.nan)
             _save_cache(
                 npz_path,
                 mean_frame=mean, var_frame=var_frame,
@@ -758,12 +807,8 @@ def _process_sequence(d: str, label: str, effective_max_frames, cache_dir: Path 
                 cal_counts=cal_counts, cal_edges=cal_edges,
                 res_counts=res_counts, res_edges=res_edges,
                 pattern=pattern, black=black, white=np.array(white),
+                temporal_acf=_tacf_save,
             )
-
-    temporal_acf = None
-    if residuals_mm is not None and MAX_TEMPORAL_LAGS > 0:
-        print(f"  Computing temporal autocorrelation (max lag {MAX_TEMPORAL_LAGS}) …")
-        temporal_acf = compute_temporal_autocorr(residuals_mm, MAX_TEMPORAL_LAGS)
 
     return dict(
         label=label, sample_rgb=sample_rgb,
@@ -796,7 +841,8 @@ def _plot_group(results: list[dict], group_label: str, out_dir: Path):
     plot_sample_frames(sample_rgbs, labels, group_dir / "sample_frames.png")
 
     mean_rgb = [demosaic_to_rgb(m, p) for m, p in zip(means, patterns)]
-    plot_mean_frames(mean_rgb, labels, group_dir / "mean_frames.png")
+    plot_mean_and_variance_frames(mean_rgb, var_frames, labels,
+                                  group_dir / "mean_and_variance_frames.png")
 
     plot_histograms(adu_hists, labels, group_dir / "histograms_adu.png",
                     title=f"Raw ADU histograms — {group_label}",

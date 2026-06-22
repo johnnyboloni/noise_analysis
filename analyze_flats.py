@@ -24,7 +24,7 @@ from pathlib import Path
 
 import numpy as np
 import matplotlib
-matplotlib.use("Agg")
+matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
 import rawpy
 

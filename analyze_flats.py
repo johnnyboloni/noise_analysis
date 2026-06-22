@@ -45,19 +45,24 @@ seqs_root = '/stage/algo-datasets/DB/DeepISP/MotionCam_RawVideos/S23+_lowlight_u
 gn3_root = '/stage/algo-datasets/DB/LME/raw/20250126_GN3v4_train'
 GN3_BLACK_LEVEL = 256
 
-SEQUENCE_DIRS = [
-    seqs_root + '260518_085011_VIDEO_24mm',
-    seqs_root + '260518_085327_VIDEO_24mm',
-    seqs_root + '260518_090426_VIDEO_24mm',
-    gn3_root + '/0240_GN3',
-    gn3_root + '/0241_GN3',
-    gn3_root + '/0250_GN3',
-    gn3_root + '/0251_GN3',
-    gn3_root + '/0260_GN3',
-    gn3_root + '/0261_GN3',
-    gn3_root + '/0270_GN3',
-    gn3_root + '/0271_GN3',
-]
+seqs= {'/stage/algo-datasets/DB/DeepISP/MotionCam_RawVideos/S23+_lowlight_uniform/':
+       ['260518_085011_VIDEO_24mm',
+        '260518_085327_VIDEO_24mm',
+        '260518_090426_VIDEO_24mm'],
+      
+       '/stage/algo-datasets/DB/LME/raw/20250126_GN3v4_train': 
+       ['/0241_GN3',
+        '/0250_GN3',
+        '/0251_GN3',
+        '/0260_GN3',
+        '/0261_GN3',
+        '/0270_GN3',
+        '/0271_GN3','/0240_GN3',]
+      }
+
+           
+
+
 OUTPUT_DIR          = "output"
 MAX_FRAMES          = None   # int to cap frames per sequence, None = load all
 HIST_BINS           = 512

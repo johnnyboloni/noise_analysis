@@ -16,6 +16,7 @@ Outputs (saved to OUTPUT_DIR):
 """
 
 import json
+import math
 import sys
 import hashlib
 from pathlib import Path
@@ -453,20 +454,38 @@ def compute_temporal_autocorr(residuals_mm: np.ndarray, max_lag: int) -> np.ndar
 # tab10 palette — 10 distinct colors, enough for all sequences
 COLORS = list(plt.cm.tab10.colors)
 ALPHA  = 0.55
+DPI    = 200
+
+
+def _grid(n: int, max_cols: int = 4) -> tuple[int, int]:
+    """Return (nrows, ncols) for a roughly-square grid of n panels."""
+    ncols = min(n, max_cols)
+    nrows = math.ceil(n / ncols)
+    return nrows, ncols
+
+
+def _make_grid_axes(n: int, panel_w: float, panel_h: float, max_cols: int = 4):
+    """Create a figure + flat list of n axes in a grid; hide leftover cells."""
+    nrows, ncols = _grid(n, max_cols)
+    fig, axes = plt.subplots(nrows, ncols,
+                             figsize=(panel_w * ncols, panel_h * nrows),
+                             squeeze=False)
+    flat = axes.ravel().tolist()
+    for ax in flat[n:]:   # hide unused cells
+        ax.set_visible(False)
+    return fig, flat[:n]
 
 
 def plot_sample_frames(rgb_frames: list[np.ndarray], labels: list[str], out: Path):
     n = len(rgb_frames)
-    fig, axes = plt.subplots(1, n, figsize=(6 * n, 5))
-    if n == 1:
-        axes = [axes]
+    fig, axes = _make_grid_axes(n, panel_w=6, panel_h=5)
     for ax, rgb, label in zip(axes, rgb_frames, labels):
         ax.imshow(rgb, aspect="auto")
         ax.set_title(f"{label}\n(sample frame)", fontsize=9)
         ax.axis("off")
-    fig.suptitle("Sample frames (demosaiced RGB)", fontsize=13, y=1.01)
+    fig.suptitle("Sample frames (demosaiced RGB)", fontsize=13)
     fig.tight_layout()
-    fig.savefig(out, dpi=150, bbox_inches="tight")
+    fig.savefig(out, dpi=DPI, bbox_inches="tight")
     plt.close(fig)
     print(f"Saved {out}")
 
@@ -474,17 +493,14 @@ def plot_sample_frames(rgb_frames: list[np.ndarray], labels: list[str], out: Pat
 def plot_mean_frames(rgb_means: list[np.ndarray], labels: list[str], out: Path):
     method = "VNG demosaic" if _HAS_CV2 else "half-res channel extraction"
     n = len(rgb_means)
-    fig, axes = plt.subplots(1, n, figsize=(6 * n, 5))
-    if n == 1:
-        axes = [axes]
+    fig, axes = _make_grid_axes(n, panel_w=6, panel_h=5)
     for ax, rgb, label in zip(axes, rgb_means, labels):
         ax.imshow(rgb, aspect="auto")
         ax.set_title(f"{label}\n(mean frame)", fontsize=9)
         ax.axis("off")
-    fig.suptitle(f"Per-pixel mean frames ({method}, per-channel stretched)",
-                 fontsize=13, y=1.01)
+    fig.suptitle(f"Per-pixel mean frames ({method}, per-channel stretched)", fontsize=13)
     fig.tight_layout()
-    fig.savefig(out, dpi=150, bbox_inches="tight")
+    fig.savefig(out, dpi=DPI, bbox_inches="tight")
     plt.close(fig)
     print(f"Saved {out}")
 
@@ -508,7 +524,7 @@ def plot_histograms(
     ax.legend(fontsize=8)
     ax.grid(True, alpha=0.3, linestyle="--")
     fig.tight_layout()
-    fig.savefig(out, dpi=150)
+    fig.savefig(out, dpi=DPI)
     plt.close(fig)
     print(f"Saved {out}")
 
@@ -521,9 +537,7 @@ def plot_autocorrelations(
     display_lags: int = 10,
 ):
     n = len(autocorrs)
-    fig, axes = plt.subplots(1, n, figsize=(5 * n, 5))
-    if n == 1:
-        axes = [axes]
+    fig, axes = _make_grid_axes(n, panel_w=5, panel_h=5)
 
     vmax = max(np.nanmax(np.abs(a)) for a in autocorrs)
     vmax = max(vmax, 1e-6)
@@ -548,7 +562,7 @@ def plot_autocorrelations(
         fontsize=12,
     )
     fig.tight_layout()
-    fig.savefig(out, dpi=150, bbox_inches="tight")
+    fig.savefig(out, dpi=DPI, bbox_inches="tight")
     plt.close(fig)
     print(f"Saved {out}")
 
@@ -560,9 +574,7 @@ def plot_variance_vs_mean(
     out: Path,
 ):
     n = len(var_frames)
-    fig, axes = plt.subplots(1, n, figsize=(5 * n, 5))
-    if n == 1:
-        axes = [axes]
+    fig, axes = _make_grid_axes(n, panel_w=5, panel_h=5)
 
     for ax, var_frame, mean_frame, label in zip(axes, var_frames, mean_frames, labels):
         mean_vals = mean_frame.ravel().astype(np.float64)
@@ -588,7 +600,7 @@ def plot_variance_vs_mean(
         fontsize=12,
     )
     fig.tight_layout()
-    fig.savefig(out, dpi=150, bbox_inches="tight")
+    fig.savefig(out, dpi=DPI, bbox_inches="tight")
     plt.close(fig)
     print(f"Saved {out}")
 
@@ -615,7 +627,7 @@ def plot_temporal_autocorr(
     ax.legend(fontsize=8)
     ax.grid(True, alpha=0.3, linestyle="--")
     fig.tight_layout()
-    fig.savefig(out, dpi=150)
+    fig.savefig(out, dpi=DPI)
     plt.close(fig)
     print(f"Saved {out}")
 
@@ -716,7 +728,7 @@ def _process_sequence(d: str, label: str, effective_max_frames, cache_dir: Path 
 
 
 def _plot_group(results: list[dict], group_label: str, out_dir: Path):
-    """Generate all plots for one group of sequences."""
+    """Generate all plots for one group of sequences, saved into a subdirectory."""
     labels      = [r['label']      for r in results]
     sample_rgbs = [r['sample_rgb'] for r in results]
     means       = [r['mean']       for r in results]
@@ -729,32 +741,33 @@ def _plot_group(results: list[dict], group_label: str, out_dir: Path):
     tacfs       = [r['temporal_acf'] for r in results if r['temporal_acf'] is not None]
     tacf_labels = [r['label']        for r in results if r['temporal_acf'] is not None]
 
-    s = f"_{group_label}"   # filename suffix
+    group_dir = out_dir / group_label
+    group_dir.mkdir(parents=True, exist_ok=True)
 
-    plot_sample_frames(sample_rgbs, labels, out_dir / f"sample_frames{s}.png")
+    plot_sample_frames(sample_rgbs, labels, group_dir / "sample_frames.png")
 
     mean_rgb = [demosaic_to_rgb(m, p) for m, p in zip(means, patterns)]
-    plot_mean_frames(mean_rgb, labels, out_dir / f"mean_frames{s}.png")
+    plot_mean_frames(mean_rgb, labels, group_dir / "mean_frames.png")
 
-    plot_histograms(adu_hists, labels, out_dir / f"histograms_adu{s}.png",
+    plot_histograms(adu_hists, labels, group_dir / "histograms_adu.png",
                     title=f"Raw ADU histograms — {group_label}",
                     xlabel="Raw pixel value (ADU)")
 
-    plot_histograms(cal_hists, labels, out_dir / f"histograms_cal{s}.png",
+    plot_histograms(cal_hists, labels, group_dir / "histograms_cal.png",
                     title=f"Calibrated histograms — {group_label}",
                     xlabel="Calibrated value  (ADU − black) / (white − black)")
 
-    plot_histograms(res_hists, labels, out_dir / f"histograms_residual{s}.png",
+    plot_histograms(res_hists, labels, group_dir / "histograms_residual.png",
                     title=f"Residual histograms — {group_label}",
                     xlabel=f"Residual  [±{RESIDUAL_HIST_RANGE}]")
 
-    plot_autocorrelations(autocorrs, labels, out_dir / f"spatial_correlation{s}.png",
+    plot_autocorrelations(autocorrs, labels, group_dir / "spatial_correlation.png",
                           lags=AUTOCORR_LAGS)
 
-    plot_variance_vs_mean(var_frames, means, labels, out_dir / f"variance_vs_mean{s}.png")
+    plot_variance_vs_mean(var_frames, means, labels, group_dir / "variance_vs_mean.png")
 
     if tacfs:
-        plot_temporal_autocorr(tacfs, tacf_labels, out_dir / f"temporal_correlation{s}.png",
+        plot_temporal_autocorr(tacfs, tacf_labels, group_dir / "temporal_correlation.png",
                                max_lag=MAX_TEMPORAL_LAGS)
 
 
@@ -795,7 +808,8 @@ def main():
     if not any_processed:
         sys.exit("No sequences processed.")
 
-    print(f"\nDone. All plots saved to: {out_dir.resolve()}")
+    print(f"\nDone. Plots saved under: {out_dir.resolve()}/<group>/")
+
 
 
 if __name__ == "__main__":

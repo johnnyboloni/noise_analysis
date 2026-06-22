@@ -624,6 +624,140 @@ def plot_temporal_autocorr(
 # Main                                                                          #
 # --------------------------------------------------------------------------- #
 
+def _process_sequence(d: str, label: str, effective_max_frames, cache_dir: Path | None):
+    """Run both streaming passes for one sequence; return a result dict."""
+    fmt = _detect_format(d)
+    paths = find_dngs(d) if fmt == 'dng' else find_raws(d)
+    if not paths:
+        print(f"  WARNING: no files found, skipping")
+        return None
+
+    if effective_max_frames:
+        paths = paths[:effective_max_frames]
+    print(f"  {len(paths)} {fmt.upper()} files")
+
+    seq_name = Path(d).name
+    npz_path = memmap_path = None
+    cached = None
+    if cache_dir and not QUICK_TEST:
+        key = _seq_cache_key(paths, effective_max_frames)
+        npz_path, memmap_path = _cache_paths(cache_dir, seq_name, key)
+        cached = _try_load_cache(npz_path, memmap_path)
+
+    if fmt == 'dng':
+        pattern, black, white = get_raw_metadata(paths[0])
+        loader = load_raw
+        sample_rgb = load_raw_rgb(paths[len(paths) // 2])
+    else:
+        pattern, black, white = get_raw_metadata_gn3(paths[0])
+        meta = json.loads(paths[0].with_suffix('.imgprops').read_text())
+        shape = (meta['height'], meta['width'])
+        loader = lambda p, _s=shape: load_raw_gn3(p, _s)
+        sample_rgb = load_raw_rgb_gn3(paths[len(paths) // 2], shape, pattern, black, white)
+
+    print(f"  Black levels (R,G,G2,B): {black}  |  White level: {white}")
+
+    if cached:
+        print(f"  [cache hit] {npz_path.name}")
+        mean         = cached['mean_frame']
+        var_frame    = cached['var_frame']
+        avg_power    = cached['avg_power']
+        frame_shape  = cached['frame_shape']
+        adu_counts   = cached['adu_counts']
+        adu_edges    = cached['adu_edges']
+        cal_counts   = cached['cal_counts']
+        cal_edges    = cached['cal_edges']
+        res_counts   = cached['res_counts']
+        res_edges    = cached['res_edges']
+        pattern      = cached['pattern']
+        black        = cached['black']
+        white        = float(cached['white'])
+        residuals_mm = cached.get('residuals_mm')
+    else:
+        print(f"  Pass 1 — mean + ADU histogram …")
+        mean, adu_counts, adu_edges = stream_pass1(
+            paths, pattern, black, white, HIST_BINS, loader,
+        )
+        print(f"  Mean calibrated range: [{mean.min():.4f}, {mean.max():.4f}]")
+
+        print(f"  Pass 2 — calibrated hist + residuals + autocorrelation + variance …")
+        (cal_counts, cal_edges, res_counts, res_edges,
+         avg_power, frame_shape, var_frame, residuals_mm) = stream_pass2(
+            paths, mean, pattern, black, white,
+            HIST_BINS, RESIDUAL_HIST_RANGE, loader,
+            memmap_path=memmap_path,
+        )
+
+        if cache_dir and npz_path:
+            _save_cache(
+                npz_path,
+                mean_frame=mean, var_frame=var_frame,
+                avg_power=avg_power, frame_shape=np.array(frame_shape),
+                adu_counts=adu_counts, adu_edges=adu_edges,
+                cal_counts=cal_counts, cal_edges=cal_edges,
+                res_counts=res_counts, res_edges=res_edges,
+                pattern=pattern, black=black, white=np.array(white),
+            )
+
+    temporal_acf = None
+    if residuals_mm is not None and MAX_TEMPORAL_LAGS > 0:
+        print(f"  Computing temporal autocorrelation (max lag {MAX_TEMPORAL_LAGS}) …")
+        temporal_acf = compute_temporal_autocorr(residuals_mm, MAX_TEMPORAL_LAGS)
+
+    return dict(
+        label=label, sample_rgb=sample_rgb,
+        mean=mean, var_frame=var_frame, pattern=pattern,
+        adu_hist=(adu_counts, adu_edges),
+        cal_hist=(cal_counts, cal_edges),
+        res_hist=(res_counts, res_edges),
+        autocorr=compute_autocorr(avg_power, frame_shape, AUTOCORR_LAGS),
+        temporal_acf=temporal_acf,
+    )
+
+
+def _plot_group(results: list[dict], group_label: str, out_dir: Path):
+    """Generate all plots for one group of sequences."""
+    labels      = [r['label']      for r in results]
+    sample_rgbs = [r['sample_rgb'] for r in results]
+    means       = [r['mean']       for r in results]
+    var_frames  = [r['var_frame']  for r in results]
+    patterns    = [r['pattern']    for r in results]
+    adu_hists   = [r['adu_hist']   for r in results]
+    cal_hists   = [r['cal_hist']   for r in results]
+    res_hists   = [r['res_hist']   for r in results]
+    autocorrs   = [r['autocorr']   for r in results]
+    tacfs       = [r['temporal_acf'] for r in results if r['temporal_acf'] is not None]
+    tacf_labels = [r['label']        for r in results if r['temporal_acf'] is not None]
+
+    s = f"_{group_label}"   # filename suffix
+
+    plot_sample_frames(sample_rgbs, labels, out_dir / f"sample_frames{s}.png")
+
+    mean_rgb = [demosaic_to_rgb(m, p) for m, p in zip(means, patterns)]
+    plot_mean_frames(mean_rgb, labels, out_dir / f"mean_frames{s}.png")
+
+    plot_histograms(adu_hists, labels, out_dir / f"histograms_adu{s}.png",
+                    title=f"Raw ADU histograms — {group_label}",
+                    xlabel="Raw pixel value (ADU)")
+
+    plot_histograms(cal_hists, labels, out_dir / f"histograms_cal{s}.png",
+                    title=f"Calibrated histograms — {group_label}",
+                    xlabel="Calibrated value  (ADU − black) / (white − black)")
+
+    plot_histograms(res_hists, labels, out_dir / f"histograms_residual{s}.png",
+                    title=f"Residual histograms — {group_label}",
+                    xlabel=f"Residual  [±{RESIDUAL_HIST_RANGE}]")
+
+    plot_autocorrelations(autocorrs, labels, out_dir / f"spatial_correlation{s}.png",
+                          lags=AUTOCORR_LAGS)
+
+    plot_variance_vs_mean(var_frames, means, labels, out_dir / f"variance_vs_mean{s}.png")
+
+    if tacfs:
+        plot_temporal_autocorr(tacfs, tacf_labels, out_dir / f"temporal_correlation{s}.png",
+                               max_lag=MAX_TEMPORAL_LAGS)
+
+
 def main():
     out_dir = Path(OUTPUT_DIR)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -632,186 +766,34 @@ def main():
     if cache_dir:
         cache_dir.mkdir(parents=True, exist_ok=True)
 
-    # QUICK_TEST overrides MAX_FRAMES for a fast end-to-end sanity check
     effective_max_frames = QUICK_TEST_FRAMES if QUICK_TEST else MAX_FRAMES
     if QUICK_TEST:
         print(f"*** QUICK_TEST mode: capping each sequence to {QUICK_TEST_FRAMES} frames ***\n")
 
-    labels = [Path(d).name for d in SEQUENCE_DIRS]
+    any_processed = False
+    for root, seq_names in seqs.items():
+        group_label = Path(root.rstrip('/')).name
+        print(f"\n{'='*60}\nGroup: {group_label}  ({len(seq_names)} sequences)\n{'='*60}")
 
-    all_means:      list[np.ndarray] = []
-    all_var_frames: list[np.ndarray] = []
-    all_patterns:   list[np.ndarray] = []
-    all_sample_rgb: list[np.ndarray] = []
-    adu_hist_data:  list[tuple] = []
-    cal_hist_data:  list[tuple] = []
-    res_hist_data:  list[tuple] = []
-    autocorrs:      list[np.ndarray] = []
-    temporal_acfs:  list[np.ndarray] = []
+        results = []
+        for i, seq_name in enumerate(seq_names):
+            d = root + seq_name
+            label = Path(seq_name.lstrip('/')).name
+            print(f"\n  [{i+1}/{len(seq_names)}] {label}")
+            r = _process_sequence(d, label, effective_max_frames, cache_dir)
+            if r is not None:
+                results.append(r)
 
-    for i, (d, label) in enumerate(zip(SEQUENCE_DIRS, labels)):
-        print(f"\nSequence {i+1}/{len(SEQUENCE_DIRS)}: {label}")
-
-        fmt = _detect_format(d)
-
-        if fmt == 'dng':
-            paths = find_dngs(d)
-        else:
-            paths = find_raws(d)
-
-        if not paths:
-            print(f"  WARNING: no files found, skipping")
+        if not results:
+            print(f"  No sequences processed for {group_label}, skipping plots.")
             continue
 
-        if effective_max_frames:
-            paths = paths[:effective_max_frames]
-        print(f"  {len(paths)} {fmt.upper()} files")
+        print(f"\nPlotting {len(results)} sequences for {group_label} …")
+        _plot_group(results, group_label, out_dir)
+        any_processed = True
 
-        seq_name = Path(d).name
-        npz_path = memmap_path = None
-        cached = None
-        if cache_dir and not QUICK_TEST:
-            key = _seq_cache_key(paths, effective_max_frames)
-            npz_path, memmap_path = _cache_paths(cache_dir, seq_name, key)
-            cached = _try_load_cache(npz_path, memmap_path)
-
-        # Set up format-specific loader and get metadata from first file
-        if fmt == 'dng':
-            pattern, black, white = get_raw_metadata(paths[0])
-            loader = load_raw
-            sample_rgb = load_raw_rgb(paths[len(paths) // 2])
-        else:
-            pattern, black, white = get_raw_metadata_gn3(paths[0])
-            meta = json.loads(paths[0].with_suffix('.imgprops').read_text())
-            shape = (meta['height'], meta['width'])
-            loader = lambda p, _s=shape: load_raw_gn3(p, _s)
-            sample_rgb = load_raw_rgb_gn3(
-                paths[len(paths) // 2], shape, pattern, black, white
-            )
-
-        print(f"  Black levels (R,G,G2,B): {black}  |  White level: {white}")
-        all_sample_rgb.append(sample_rgb)
-
-        if cached:
-            print(f"  [cache hit] {npz_path.name}")
-            mean         = cached['mean_frame']
-            var_frame    = cached['var_frame']
-            avg_power    = cached['avg_power']
-            frame_shape  = cached['frame_shape']
-            adu_counts   = cached['adu_counts']
-            adu_edges    = cached['adu_edges']
-            cal_counts   = cached['cal_counts']
-            cal_edges    = cached['cal_edges']
-            res_counts   = cached['res_counts']
-            res_edges    = cached['res_edges']
-            pattern      = cached['pattern']
-            black        = cached['black']
-            white        = float(cached['white'])
-            residuals_mm = cached.get('residuals_mm')
-        else:
-            print(f"  Pass 1 — mean + ADU histogram …")
-            mean, adu_counts, adu_edges = stream_pass1(
-                paths, pattern, black, white, HIST_BINS, loader,
-            )
-            print(f"  Mean calibrated range: [{mean.min():.4f}, {mean.max():.4f}]")
-
-            print(f"  Pass 2 — calibrated hist + residuals + autocorrelation + variance …")
-            (cal_counts, cal_edges, res_counts, res_edges,
-             avg_power, frame_shape, var_frame, residuals_mm) = stream_pass2(
-                paths, mean, pattern, black, white,
-                HIST_BINS, RESIDUAL_HIST_RANGE, loader,
-                memmap_path=memmap_path,
-            )
-
-            if cache_dir and npz_path:
-                _save_cache(
-                    npz_path,
-                    mean_frame=mean,
-                    var_frame=var_frame,
-                    avg_power=avg_power,
-                    frame_shape=np.array(frame_shape),
-                    adu_counts=adu_counts,
-                    adu_edges=adu_edges,
-                    cal_counts=cal_counts,
-                    cal_edges=cal_edges,
-                    res_counts=res_counts,
-                    res_edges=res_edges,
-                    pattern=pattern,
-                    black=black,
-                    white=np.array(white),
-                )
-
-        all_means.append(mean)
-        all_var_frames.append(var_frame)
-        all_patterns.append(pattern)
-        adu_hist_data.append((adu_counts, adu_edges))
-        cal_hist_data.append((cal_counts, cal_edges))
-        res_hist_data.append((res_counts, res_edges))
-        autocorrs.append(compute_autocorr(avg_power, frame_shape, AUTOCORR_LAGS))
-
-        if residuals_mm is not None and MAX_TEMPORAL_LAGS > 0:
-            print(f"  Computing temporal autocorrelation (max lag {MAX_TEMPORAL_LAGS}) …")
-            temporal_acfs.append(
-                compute_temporal_autocorr(residuals_mm, MAX_TEMPORAL_LAGS)
-            )
-
-    if not all_means:
+    if not any_processed:
         sys.exit("No sequences processed.")
-
-    # ------------------------------------------------------------------ #
-    # Plots                                                                 #
-    # ------------------------------------------------------------------ #
-    print("\nPlotting sample frames …")
-    plot_sample_frames(all_sample_rgb, labels, out_dir / "sample_frames.png")
-
-    print("Plotting mean frames …")
-    mean_rgb = [demosaic_to_rgb(m, p) for m, p in zip(all_means, all_patterns)]
-    plot_mean_frames(mean_rgb, labels, out_dir / "mean_frames.png")
-
-    print("Plotting ADU histograms …")
-    plot_histograms(
-        adu_hist_data, labels,
-        out_dir / "histograms_adu.png",
-        title="Pixel-value histograms — raw ADU (before calibration)",
-        xlabel="Raw pixel value (ADU)",
-    )
-
-    print("Plotting calibrated histograms …")
-    plot_histograms(
-        cal_hist_data, labels,
-        out_dir / "histograms_cal.png",
-        title="Pixel-value histograms — calibrated frames",
-        xlabel="Calibrated value  (ADU − black) / (white − black)",
-    )
-
-    print("Plotting residual histograms …")
-    plot_histograms(
-        res_hist_data, labels,
-        out_dir / "histograms_residual.png",
-        title="Pixel-value histograms — residuals (frames − mean frame)",
-        xlabel=f"Residual  [±{RESIDUAL_HIST_RANGE}]",
-    )
-
-    print("Plotting spatial autocorrelations …")
-    plot_autocorrelations(
-        autocorrs, labels,
-        out_dir / "spatial_correlation.png",
-        lags=AUTOCORR_LAGS,
-    )
-
-    print("Plotting per-pixel variance vs mean …")
-    plot_variance_vs_mean(
-        all_var_frames, all_means, labels,
-        out_dir / "variance_vs_mean.png",
-    )
-
-    if temporal_acfs:
-        print("Plotting temporal autocorrelations …")
-        plot_temporal_autocorr(
-            temporal_acfs, labels[:len(temporal_acfs)],
-            out_dir / "temporal_correlation.png",
-            max_lag=MAX_TEMPORAL_LAGS,
-        )
 
     print(f"\nDone. All plots saved to: {out_dir.resolve()}")
 

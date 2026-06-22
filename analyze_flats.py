@@ -665,7 +665,7 @@ def main():
         seq_name = Path(d).name
         npz_path = memmap_path = None
         cached = None
-        if cache_dir:
+        if cache_dir and not QUICK_TEST:
             key = _seq_cache_key(paths, effective_max_frames)
             npz_path, memmap_path = _cache_paths(cache_dir, seq_name, key)
             cached = _try_load_cache(npz_path, memmap_path)

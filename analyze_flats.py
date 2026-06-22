@@ -15,6 +15,7 @@ Outputs (saved to OUTPUT_DIR):
   - temporal_correlation.png : temporal noise autocorrelation function
 """
 
+import argparse
 import json
 import math
 import sys
@@ -636,6 +637,54 @@ def plot_temporal_autocorr(
 # Main                                                                          #
 # --------------------------------------------------------------------------- #
 
+def _none_or_auto(s: str):
+    """argparse type for config values that can be None or a scalar."""
+    if s.lower() == 'none':
+        return None
+    try:
+        return int(s)
+    except ValueError:
+        pass
+    try:
+        return float(s)
+    except ValueError:
+        pass
+    return s
+
+
+def _apply_cli_overrides() -> None:
+    """Override any ALL_CAPS scalar config constant via a matching --lower-kebab-case flag."""
+    g = globals()
+    scalar = (bool, int, float, str, type(None))
+    keys = sorted(k for k in g if k.isupper() and not k.startswith('_') and isinstance(g[k], scalar))
+
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    for key in keys:
+        val = g[key]
+        flag = '--' + key.lower().replace('_', '-')
+        if isinstance(val, bool):
+            parser.add_argument(flag, dest=key, default=None,
+                                action=argparse.BooleanOptionalAction,
+                                help=f"(default: {val})")
+        elif isinstance(val, int):
+            parser.add_argument(flag, dest=key, type=int, default=None, metavar='N',
+                                help=f"(default: {val})")
+        elif isinstance(val, float):
+            parser.add_argument(flag, dest=key, type=float, default=None, metavar='F',
+                                help=f"(default: {val})")
+        else:  # str or None
+            parser.add_argument(flag, dest=key, type=_none_or_auto, default=None, metavar='S',
+                                help=f"(default: {val!r}; pass 'none' to clear)")
+
+    args = parser.parse_args()
+    for key, new_val in vars(args).items():
+        if new_val is not None:
+            g[key] = new_val
+
+
 def _process_sequence(d: str, label: str, effective_max_frames, cache_dir: Path | None):
     """Run both streaming passes for one sequence; return a result dict."""
     fmt = _detect_format(d)
@@ -772,6 +821,8 @@ def _plot_group(results: list[dict], group_label: str, out_dir: Path):
 
 
 def main():
+    _apply_cli_overrides()
+
     out_dir = Path(OUTPUT_DIR)
     out_dir.mkdir(parents=True, exist_ok=True)
 

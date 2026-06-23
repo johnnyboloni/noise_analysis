@@ -737,6 +737,8 @@ def _process_sequence(d: str, label: str, effective_max_frames, cache_dir: Path 
         key = _seq_cache_key(paths, effective_max_frames)
         npz_path, memmap_path = _cache_paths(cache_dir, seq_name, key)
         cached = _try_load_cache(npz_path, memmap_path)
+    else:
+        print(f"  [debug] skipping cache/memmap: cache_dir={cache_dir!r}  QUICK_TEST={QUICK_TEST}")
 
     if fmt == 'dng':
         pattern, black, white = get_raw_metadata(paths[0])
@@ -795,10 +797,13 @@ def _process_sequence(d: str, label: str, effective_max_frames, cache_dir: Path 
             memmap_path=memmap_path,
         )
 
+        print(f"  [debug] memmap_path={memmap_path}  residuals_mm={'set' if residuals_mm is not None else 'None'}")
         temporal_acf = None
         if residuals_mm is not None and MAX_TEMPORAL_LAGS > 0:
             print(f"  Computing temporal autocorrelation (max lag {MAX_TEMPORAL_LAGS}) …")
             temporal_acf = compute_temporal_autocorr(residuals_mm, MAX_TEMPORAL_LAGS)
+        else:
+            print(f"  [debug] skipping temporal ACF: residuals_mm={'set' if residuals_mm is not None else 'None'}  MAX_TEMPORAL_LAGS={MAX_TEMPORAL_LAGS}")
 
         if cache_dir and npz_path:
             _tacf_save = temporal_acf if temporal_acf is not None else np.full(MAX_TEMPORAL_LAGS + 1, np.nan)

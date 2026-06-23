@@ -771,12 +771,15 @@ def _process_sequence(d: str, label: str, effective_max_frames, cache_dir: Path 
         if _tacf is not None and not np.all(np.isnan(_tacf)):
             temporal_acf = _tacf
         else:
-            # Old cache without temporal_acf — try memmap fallback then give up
+            # Old cache without temporal_acf — try memmap fallback
             temporal_acf = None
             residuals_mm = cached.get('residuals_mm')
             if residuals_mm is not None and MAX_TEMPORAL_LAGS > 0:
                 print(f"  Computing temporal autocorrelation (max lag {MAX_TEMPORAL_LAGS}) …")
                 temporal_acf = compute_temporal_autocorr(residuals_mm, MAX_TEMPORAL_LAGS)
+            else:
+                print(f"  [warn] temporal_acf missing from cache and no residuals memmap found.")
+                print(f"         Delete cache/*.npz and re-run to regenerate.")
     else:
         print(f"  Pass 1 — mean + ADU histogram …")
         mean, adu_counts, adu_edges = stream_pass1(
@@ -864,6 +867,8 @@ def _plot_group(results: list[dict], group_label: str, out_dir: Path):
     if tacfs:
         plot_temporal_autocorr(tacfs, tacf_labels, group_dir / "temporal_correlation.png",
                                max_lag=MAX_TEMPORAL_LAGS)
+    else:
+        print(f"  [warn] No temporal ACF data for {group_label} — skipping temporal_correlation.png")
 
 
 def main():

@@ -416,6 +416,10 @@ def compute_temporal_autocorr(residuals_mm: np.ndarray, max_lag: int) -> np.ndar
     Normalized temporal ACF: C(k) = <r(t)·r(t+k)> / <r(t)²>
     averaged over all pixels and valid frame pairs.
     C(0) = 1 by definition; C(k) ≈ 0 for k > 0 means temporally uncorrelated frames.
+
+    Bias correction: subtracting the sample mean introduces a known negative bias of
+    -1/(N-1) at every lag k > 0 (the mean frame was estimated from the same N frames).
+    We correct for this analytically so the estimator is unbiased under shot noise.
     """
     N, H, W = residuals_mm.shape
     pixel_count = H * W
@@ -444,6 +448,11 @@ def compute_temporal_autocorr(residuals_mm: np.ndarray, max_lag: int) -> np.ndar
 
     if max_lag >= N:
         acf[N:] = np.nan
+
+    # Correct for mean-subtraction bias: E[C(k)] = -1/(N-1) for k>0 under i.i.d. frames.
+    if N > 1:
+        acf[1:] += 1.0 / (N - 1)
+
     print()
     return acf
 
@@ -654,8 +663,8 @@ def plot_temporal_autocorr(
     ax.set_xlabel("Temporal lag (frames)", fontsize=10)
     ax.set_ylabel("Normalized correlation", fontsize=10)
     ax.set_title(
-        "Temporal noise autocorrelation\n"
-        "(0 = independent frames, expected for Poisson shot noise)",
+        "Temporal noise autocorrelation (bias-corrected for sample-mean subtraction)\n"
+        "0 = independent frames, expected for Poisson shot noise",
         fontsize=12,
     )
     ax.legend(fontsize=8)

@@ -737,7 +737,9 @@ def _process_sequence(d: str, label: str, effective_max_frames, cache_dir: Path 
 
     if effective_max_frames:
         paths = paths[:effective_max_frames]
-    print(f"  {len(paths)} {fmt.upper()} files")
+    n_frames = len(paths)
+    print(f"  {n_frames} {fmt.upper()} files")
+    label = f"{label}  (N={n_frames})"
 
     seq_name = Path(d).name
     npz_path = memmap_path = None

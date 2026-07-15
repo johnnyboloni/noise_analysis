@@ -108,6 +108,15 @@ def get_dark_metadata(path: Path):
             iso = int(raw.camera_isoValue)
         except Exception:
             iso = None
+
+    sidecar = path.with_suffix(".json")
+    if sidecar.exists():
+        try:
+            import json
+            iso = int(json.loads(sidecar.read_text())["iso"])
+        except Exception:
+            pass
+
     return pattern, black, white, iso
 
 

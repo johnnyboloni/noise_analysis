@@ -207,6 +207,7 @@ def plot_histogram_adu(mean_cal, pattern, black, white, title, out):
     """Per-channel ADU histogram of the mean frame with black-level markers."""
     slices = _ch_slices(pattern)
     fig, ax = plt.subplots(figsize=(9, 5))
+    xmax = 0.0
     for ch, (r, c) in sorted(slices.items()):
         bl  = float(black[ch])
         pix = mean_cal[r::2, c::2].ravel().astype(np.float64) * (white - bl) + bl
@@ -218,6 +219,8 @@ def plot_histogram_adu(mean_cal, pattern, black, white, title, out):
                   label=_CH_NAMES[ch], linewidth=0.8)
         ax.axvline(bl, color=_CH_COLORS[ch],
                    linewidth=1.5, linestyle="--", alpha=0.9)
+        xmax = max(xmax, float(np.percentile(pix, 99.9)))
+    ax.set_xlim(left=0, right=xmax * 1.05)
     ax.set_xlabel("Raw pixel value (ADU)", fontsize=10)
     ax.set_ylabel("Density", fontsize=10)
     ax.set_title(title, fontsize=12)

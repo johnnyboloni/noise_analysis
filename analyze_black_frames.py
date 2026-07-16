@@ -218,15 +218,21 @@ def plot_histogram_adu(adu_counts, adu_edges, black, title, out):
     bl_mean = float(np.mean(black))
     density = adu_counts / (adu_counts.sum() * 1.0)
 
-    # clip x-axis to rightmost non-zero bin with a small margin
+    # clip both sides to the actual data range with a small margin
     nonzero = np.nonzero(adu_counts)[0]
-    xmax = (adu_edges[nonzero[-1] + 1] * 1.05) if len(nonzero) else adu_edges[-1]
+    if len(nonzero):
+        span   = adu_edges[nonzero[-1] + 1] - adu_edges[nonzero[0]]
+        margin = max(span * 0.05, 5.0)
+        xmin   = max(0.0, adu_edges[nonzero[0]] - margin)
+        xmax   = adu_edges[nonzero[-1] + 1] + margin
+    else:
+        xmin, xmax = adu_edges[0], adu_edges[-1]
 
     fig, ax = plt.subplots(figsize=(9, 5))
     ax.stairs(density, adu_edges, fill=True, color=COLORS[0], alpha=ALPHA, linewidth=0.8)
     ax.axvline(bl_mean, color="red", linewidth=1.5, linestyle="--",
                label=f"black level ({bl_mean:.0f})")
-    ax.set_xlim(left=0, right=xmax)
+    ax.set_xlim(left=xmin, right=xmax)
     ax.set_xlabel("Raw pixel value (ADU)", fontsize=10)
     ax.set_ylabel("Density", fontsize=10)
     ax.set_title(title, fontsize=12)
@@ -320,7 +326,8 @@ def plot_temporal_drift(frame_means, title, out):
 
 def plot_summary(results: list[dict], out: Path):
     n = len(results)
-    fig, (ax_h, ax_n, ax_hp) = plt.subplots(1, 3, figsize=(15, 5))
+    fig, axes = plt.subplots(1, 4, figsize=(20, 5))
+    ax_h, ax_n, ax_hp, ax_v = axes
 
     for i, r in enumerate(results):
         color = COLORS[i % len(COLORS)]
@@ -355,6 +362,18 @@ def plot_summary(results: list[dict], out: Path):
     ax_hp.set_ylabel("Hot pixel count", fontsize=9)
     ax_hp.set_title(f"Hot pixels (>{HOT_PIXEL_NSIGMA}σ) by condition", fontsize=11)
     ax_hp.grid(True, alpha=0.3, linestyle="--", axis="y")
+
+    # histogram variance (ADU²) vs gain (ISO / 100)
+    gains    = [r["iso"] / 100.0 if r["iso"] else float("nan") for r in results]
+    adu_vars = [r["adu_var"] for r in results]
+    ax_v.scatter(gains, adu_vars, color=colors, s=60, zorder=3)
+    for g, v, c, lbl in zip(gains, adu_vars, colors, xlabels):
+        ax_v.annotate(lbl, (g, v), fontsize=6, ha="left", va="bottom",
+                      xytext=(3, 3), textcoords="offset points")
+    ax_v.set_xlabel("Gain  (ISO / 100)", fontsize=9)
+    ax_v.set_ylabel("Dark histogram variance (ADU²)", fontsize=9)
+    ax_v.set_title("Variance vs gain", fontsize=11)
+    ax_v.grid(True, alpha=0.3, linestyle="--")
 
     fig.suptitle("Dark frame summary — all conditions", fontsize=13)
     fig.tight_layout()
@@ -411,6 +430,9 @@ def main():
 
         std_cal      = np.sqrt(var_cal)
         median_noise = float(np.median(std_cal))
+        bl_mean      = float(np.mean(black))
+        adu_var      = float(np.average(adu_counts * (adu_edges[:-1] - bl_mean) ** 2)
+                            / adu_counts.sum()) if adu_counts.sum() > 0 else 0.0
 
         sub_out = out_dir / d.name
         sub_out.mkdir(exist_ok=True)
@@ -441,6 +463,7 @@ def main():
         results.append(dict(
             label=label, iso=iso,
             mean_cal=mean_cal, median_noise=median_noise, n_hot=n_hot,
+            adu_var=adu_var,
         ))
 
     if not results:

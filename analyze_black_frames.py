@@ -28,7 +28,7 @@ import rawpy
 # ============================================================
 # CONFIG — edit paths and options here
 # ============================================================
-ROOT_DIR         = "/path/to/dark/frames"  # root containing one subdir per condition
+ROOT_DIR         = "/home/yonif/motioncam/decoded/"  # root containing one subdir per condition
 OUTPUT_DIR       = "output_dark"
 HIST_BINS        = 512
 HOT_PIXEL_NSIGMA = 5.0    # pixels > this many × median noise are flagged as hot

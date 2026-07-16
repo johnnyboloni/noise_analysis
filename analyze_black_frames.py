@@ -178,8 +178,9 @@ def stream_dark(paths: list[Path], pattern: np.ndarray,
     adu_counts  : int64 (HIST_BINS,)
     adu_edges   : float64 (HIST_BINS+1,)
     """
-    adu_edges  = np.linspace(0, white + 1, HIST_BINS + 1)
-    adu_counts = np.zeros(HIST_BINS, dtype=np.int64)
+    n_bins     = int(white) + 1
+    adu_edges  = np.arange(0, white + 2, dtype=np.float64)  # one bin per ADU value
+    adu_counts = np.zeros(n_bins, dtype=np.int64)
     accum: np.ndarray | None = None
 
     for i, p in enumerate(paths):
@@ -212,28 +213,28 @@ def stream_dark(paths: list[Path], pattern: np.ndarray,
 # Per-subdir plots                                                               #
 # --------------------------------------------------------------------------- #
 
-def plot_histogram_adu(mean_cal, pattern, black, white, title, out):
-    """Per-channel ADU histogram of the mean frame with black-level markers."""
-    slices = _ch_slices(pattern)
+def plot_histogram_adu(mean_cal, black, white, title, out):
+    """All-pixel ADU histogram of the mean frame with a black-level marker."""
+    bl_mean = float(np.mean(black))
+    n_bins  = int(white) + 1
+    edges   = np.arange(0, white + 2, dtype=np.float64)
+
+    pix = (mean_cal.ravel().astype(np.float64) * (white - bl_mean) + bl_mean)
+    counts, _ = np.histogram(pix, bins=edges)
+    width      = 1.0
+    density    = counts / (counts.sum() * width)
+
+    xmax = float(np.percentile(pix, 99.9)) * 1.05
+
     fig, ax = plt.subplots(figsize=(9, 5))
-    xmax = 0.0
-    for ch, (r, c) in sorted(slices.items()):
-        bl  = float(black[ch])
-        pix = mean_cal[r::2, c::2].ravel().astype(np.float64) * (white - bl) + bl
-        counts, edges = np.histogram(pix, bins=HIST_BINS, range=(0, white + 1))
-        width   = edges[1] - edges[0]
-        density = counts / (counts.sum() * width)
-        ax.stairs(density, edges, fill=True,
-                  color=_CH_COLORS[ch], alpha=ALPHA,
-                  label=_CH_NAMES[ch], linewidth=0.8)
-        ax.axvline(bl, color=_CH_COLORS[ch],
-                   linewidth=1.5, linestyle="--", alpha=0.9)
-        xmax = max(xmax, float(np.percentile(pix, 99.9)))
-    ax.set_xlim(left=0, right=xmax * 1.05)
+    ax.stairs(density, edges, fill=True, color=COLORS[0], alpha=ALPHA, linewidth=0.8)
+    ax.axvline(bl_mean, color="red", linewidth=1.5, linestyle="--",
+               label=f"black level ({bl_mean:.0f})")
+    ax.set_xlim(left=0, right=xmax)
     ax.set_xlabel("Raw pixel value (ADU)", fontsize=10)
     ax.set_ylabel("Density", fontsize=10)
     ax.set_title(title, fontsize=12)
-    ax.legend(fontsize=9, title="channel  (dashed = black level)")
+    ax.legend(fontsize=9)
     ax.grid(True, alpha=0.3, linestyle="--")
     fig.tight_layout()
     fig.savefig(out, dpi=DPI)
@@ -418,7 +419,7 @@ def main():
         sub_out = out_dir / d.name
         sub_out.mkdir(exist_ok=True)
 
-        plot_histogram_adu(mean_cal, pattern, black, white,
+        plot_histogram_adu(mean_cal, black, white,
                            title=f"Dark ADU histogram — {t_suffix}",
                            out=sub_out / "histogram_adu.png")
 

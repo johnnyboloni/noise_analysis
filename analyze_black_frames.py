@@ -213,21 +213,17 @@ def stream_dark(paths: list[Path], pattern: np.ndarray,
 # Per-subdir plots                                                               #
 # --------------------------------------------------------------------------- #
 
-def plot_histogram_adu(mean_cal, black, white, title, out):
-    """All-pixel ADU histogram of the mean frame with a black-level marker."""
+def plot_histogram_adu(adu_counts, adu_edges, black, title, out):
+    """Raw ADU histogram (all frames summed) with a black-level marker."""
     bl_mean = float(np.mean(black))
-    n_bins  = int(white) + 1
-    edges   = np.arange(0, white + 2, dtype=np.float64)
+    density = adu_counts / (adu_counts.sum() * 1.0)
 
-    pix = (mean_cal.ravel().astype(np.float64) * (white - bl_mean) + bl_mean)
-    counts, _ = np.histogram(pix, bins=edges)
-    width      = 1.0
-    density    = counts / (counts.sum() * width)
-
-    xmax = float(np.percentile(pix, 99.9)) * 1.05
+    # clip x-axis to rightmost non-zero bin with a small margin
+    nonzero = np.nonzero(adu_counts)[0]
+    xmax = (adu_edges[nonzero[-1] + 1] * 1.05) if len(nonzero) else adu_edges[-1]
 
     fig, ax = plt.subplots(figsize=(9, 5))
-    ax.stairs(density, edges, fill=True, color=COLORS[0], alpha=ALPHA, linewidth=0.8)
+    ax.stairs(density, adu_edges, fill=True, color=COLORS[0], alpha=ALPHA, linewidth=0.8)
     ax.axvline(bl_mean, color="red", linewidth=1.5, linestyle="--",
                label=f"black level ({bl_mean:.0f})")
     ax.set_xlim(left=0, right=xmax)
@@ -419,7 +415,7 @@ def main():
         sub_out = out_dir / d.name
         sub_out.mkdir(exist_ok=True)
 
-        plot_histogram_adu(mean_cal, black, white,
+        plot_histogram_adu(adu_counts, adu_edges, black,
                            title=f"Dark ADU histogram — {t_suffix}",
                            out=sub_out / "histogram_adu.png")
 

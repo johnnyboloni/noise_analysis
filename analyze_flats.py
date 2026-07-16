@@ -283,6 +283,20 @@ def _save_cache(npz_path: Path, **arrays):
 # Streaming passes                                                               #
 # --------------------------------------------------------------------------- #
 
+def _filter_readable(paths: list[Path], loader) -> list[Path]:
+    """Try loading each file; drop and warn on any I/O error."""
+    good = []
+    for p in paths:
+        try:
+            loader(p)
+            good.append(p)
+        except Exception as exc:
+            print(f"  WARNING: skipping {p.name} — {exc}")
+    if len(good) < len(paths):
+        print(f"  {len(paths) - len(good)} file(s) skipped; {len(good)} remaining.")
+    return good
+
+
 def stream_pass1(
     paths: list[Path],
     pattern: np.ndarray,

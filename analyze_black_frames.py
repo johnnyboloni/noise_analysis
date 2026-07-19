@@ -382,12 +382,31 @@ def plot_variance_vs_gain(results: list[dict], out: Path):
     vars_  = [s ** 2 for s in sigmas]
     labels = [r["label"] for r in results]
 
+    g_arr = np.array(gains, dtype=np.float64)
+    s_arr = np.array(sigmas, dtype=np.float64)
+    v_arr = np.array(vars_,  dtype=np.float64)
+    valid = np.isfinite(g_arr) & np.isfinite(s_arr)
+
     fig, (ax_s, ax_v) = plt.subplots(1, 2, figsize=(12, 5))
     handles = []
     for g, s, v, c, lbl in zip(gains, sigmas, vars_, colors, labels):
         h = ax_s.scatter(g, s, color=c, s=70, zorder=3)
         ax_v.scatter(g, v, color=c, s=70, zorder=3)
         handles.append(h)
+
+    # fit lines (only when ≥2 valid points)
+    if valid.sum() >= 2:
+        g_fit = np.linspace(g_arr[valid].min(), g_arr[valid].max(), 200)
+        # linear fit for σ
+        c1 = np.polyfit(g_arr[valid], s_arr[valid], 1)
+        ax_s.plot(g_fit, np.polyval(c1, g_fit), "k--", linewidth=1.2,
+                  label=f"linear fit  (slope={c1[0]:.4f})")
+        ax_s.legend(fontsize=8)
+        # quadratic fit for σ²
+        c2 = np.polyfit(g_arr[valid], v_arr[valid], 2)
+        ax_v.plot(g_fit, np.polyval(c2, g_fit), "k--", linewidth=1.2,
+                  label=f"quadratic fit  (a={c2[0]:.2e})")
+        ax_v.legend(fontsize=8)
 
     ax_s.set_xlabel("Gain  (ISO / 100)", fontsize=10)
     ax_s.set_ylabel("Median read noise σ (calibrated)", fontsize=10)

@@ -9,7 +9,6 @@ For each subdir of ROOT_DIR, outputs (saved to OUTPUT_DIR/<subdir>/):
   - read_noise_map.png   : per-pixel temporal std heatmap
   - hot_pixels.png       : binary map of pixels > HOT_PIXEL_NSIGMA × median noise
   - fnp_profiles.png     : column and row fixed-pattern noise profiles
-  - temporal_drift.png   : per-frame mean dark level over time
   - summary_all.png      : cross-condition comparison (written to OUTPUT_DIR/)
 """
 
@@ -196,18 +195,16 @@ def stream_dark(paths: list[Path], pattern: np.ndarray,
     mean_cal = (accum / len(paths)).astype(np.float32)
 
     var_accum: np.ndarray | None = None
-    frame_means = np.zeros(len(paths), dtype=np.float64)
 
     for i, p in enumerate(paths):
         print(f"  pass 2  [{i+1}/{len(paths)}] {p.name}", end="\r", flush=True)
         cal = calibrate_frame(_load_frame(p), pattern, black, white)
-        frame_means[i] = float(cal.mean())
         res = cal.astype(np.float64) - mean_cal
         var_accum = res ** 2 if var_accum is None else var_accum + res ** 2
     print()
 
     var_cal = (var_accum / len(paths)).astype(np.float32)
-    return mean_cal, var_cal, frame_means, adu_counts, adu_edges
+    return mean_cal, var_cal, adu_counts, adu_edges
 
 
 # --------------------------------------------------------------------------- #
@@ -302,21 +299,6 @@ def plot_fnp_profiles(mean_cal, title, out):
     plt.close(fig)
     print(f"  Saved {out.name}")
 
-
-def plot_temporal_drift(frame_means, title, out):
-    fig, ax = plt.subplots(figsize=(9, 4))
-    ax.plot(frame_means, "o-", markersize=3, linewidth=1.0, color=COLORS[0])
-    ax.axhline(float(np.median(frame_means)), color="k", linewidth=1.0,
-               linestyle="--", alpha=0.6, label="median")
-    ax.set_xlabel("Frame index", fontsize=10)
-    ax.set_ylabel("Spatial mean dark (calibrated)", fontsize=10)
-    ax.set_title(title, fontsize=12)
-    ax.legend(fontsize=9)
-    ax.grid(True, alpha=0.3, linestyle="--")
-    fig.tight_layout()
-    fig.savefig(out, dpi=DPI)
-    plt.close(fig)
-    print(f"  Saved {out.name}")
 
 
 # --------------------------------------------------------------------------- #
@@ -470,7 +452,7 @@ def main():
         print(f"  {label}")
         print(f"  Black levels: {black}  White: {white:.0f}")
 
-        mean_cal, var_cal, frame_means, adu_counts, adu_edges = stream_dark(
+        mean_cal, var_cal, adu_counts, adu_edges = stream_dark(
             paths, pattern, black, white,
         )
 
@@ -498,10 +480,6 @@ def main():
         plot_fnp_profiles(mean_cal,
                           title=f"Fixed-pattern noise profiles — {t_suffix}",
                           out=sub_out / "fnp_profiles.png")
-
-        plot_temporal_drift(frame_means,
-                            title=f"Temporal dark-level drift — {t_suffix}",
-                            out=sub_out / "temporal_drift.png")
 
         print(f"  Median read noise σ : {median_noise:.6f} (calibrated)")
         print(f"  Hot pixels          : {n_hot:,} ({100*n_hot/std_cal.size:.3f}%)")

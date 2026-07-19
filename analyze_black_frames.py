@@ -31,6 +31,7 @@ import rawpy
 ROOT_DIR         = "/home/yonif/motioncam/decoded/"  # root containing one subdir per condition
 OUTPUT_DIR       = "output_dark"
 HIST_BINS        = 512
+HIST_ADU_XMAX    = 500     # right x-axis limit for ADU histogram plots (ADU); None = auto
 HOT_PIXEL_NSIGMA = 5.0    # pixels > this many × median noise are flagged as hot
 MAX_FRAMES       = None    # int to cap frames per subdir; None = all
 # ============================================================
@@ -218,15 +219,13 @@ def plot_histogram_adu(adu_counts, adu_edges, black, title, out):
     bl_mean = float(np.mean(black))
     density = adu_counts / (adu_counts.sum() * 1.0)
 
-    # clip both sides to the actual data range with a small margin
+    # left: just below leftmost non-zero bin; right: HIST_ADU_XMAX or auto
     nonzero = np.nonzero(adu_counts)[0]
-    if len(nonzero):
-        span   = adu_edges[nonzero[-1] + 1] - adu_edges[nonzero[0]]
-        margin = max(span * 0.05, 5.0)
-        xmin   = max(0.0, adu_edges[nonzero[0]] - margin)
-        xmax   = adu_edges[nonzero[-1] + 1] + margin
+    xmin = max(0.0, adu_edges[nonzero[0]] - 5.0) if len(nonzero) else 0.0
+    if HIST_ADU_XMAX is not None:
+        xmax = float(HIST_ADU_XMAX)
     else:
-        xmin, xmax = adu_edges[0], adu_edges[-1]
+        xmax = (adu_edges[nonzero[-1] + 1] + 5.0) if len(nonzero) else adu_edges[-1]
 
     fig, ax = plt.subplots(figsize=(9, 5))
     ax.stairs(density, adu_edges, fill=True, color=COLORS[0], alpha=ALPHA, linewidth=0.8)
@@ -326,8 +325,7 @@ def plot_temporal_drift(frame_means, title, out):
 
 def plot_summary(results: list[dict], out: Path):
     n = len(results)
-    fig, axes = plt.subplots(1, 4, figsize=(20, 5))
-    ax_h, ax_n, ax_hp, ax_v = axes
+    fig, (ax_h, ax_n, ax_hp) = plt.subplots(1, 3, figsize=(15, 5))
 
     for i, r in enumerate(results):
         color = COLORS[i % len(COLORS)]
@@ -363,19 +361,33 @@ def plot_summary(results: list[dict], out: Path):
     ax_hp.set_title(f"Hot pixels (>{HOT_PIXEL_NSIGMA}σ) by condition", fontsize=11)
     ax_hp.grid(True, alpha=0.3, linestyle="--", axis="y")
 
-    # histogram variance (ADU²) vs gain (ISO / 100)
-    gains    = [r["iso"] / 100.0 if r["iso"] else float("nan") for r in results]
-    adu_vars = [r["adu_var"] for r in results]
-    ax_v.scatter(gains, adu_vars, color=colors, s=60, zorder=3)
-    for g, v, c, lbl in zip(gains, adu_vars, colors, xlabels):
-        ax_v.annotate(lbl, (g, v), fontsize=6, ha="left", va="bottom",
-                      xytext=(3, 3), textcoords="offset points")
-    ax_v.set_xlabel("Gain  (ISO / 100)", fontsize=9)
-    ax_v.set_ylabel("Dark histogram variance (ADU²)", fontsize=9)
-    ax_v.set_title("Variance vs gain", fontsize=11)
-    ax_v.grid(True, alpha=0.3, linestyle="--")
-
     fig.suptitle("Dark frame summary — all conditions", fontsize=13)
+    fig.tight_layout()
+    fig.savefig(out, dpi=DPI, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved {out}")
+
+
+def plot_variance_vs_gain(results: list[dict], out: Path):
+    """Scatter: dark histogram variance (ADU²) vs gain (ISO/100), legend on the side."""
+    colors  = [COLORS[i % len(COLORS)] for i in range(len(results))]
+    gains   = [r["iso"] / 100.0 if r["iso"] else float("nan") for r in results]
+    adu_vars = [r["adu_var"] for r in results]
+    labels  = [r["label"] for r in results]
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    handles = []
+    for g, v, c, lbl in zip(gains, adu_vars, colors, labels):
+        h = ax.scatter(g, v, color=c, s=70, zorder=3, label=lbl)
+        handles.append(h)
+
+    ax.set_xlabel("Gain  (ISO / 100)", fontsize=10)
+    ax.set_ylabel("Dark histogram variance (ADU²)", fontsize=10)
+    ax.set_title("Dark variance vs gain", fontsize=12)
+    ax.grid(True, alpha=0.3, linestyle="--")
+    ax.legend(handles=handles, labels=labels,
+              fontsize=8, loc="upper left",
+              bbox_to_anchor=(1.01, 1), borderaxespad=0)
     fig.tight_layout()
     fig.savefig(out, dpi=DPI, bbox_inches="tight")
     plt.close(fig)
@@ -471,6 +483,7 @@ def main():
 
     print(f"\n{'─'*60}")
     plot_summary(results, out_dir / "summary_all.png")
+    plot_variance_vs_gain(results, out_dir / "variance_vs_gain.png")
     print(f"\nDone. All plots saved under: {out_dir.resolve()}/")
 
 

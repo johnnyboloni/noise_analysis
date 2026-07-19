@@ -369,25 +369,40 @@ def plot_summary(results: list[dict], out: Path):
 
 
 def plot_variance_vs_gain(results: list[dict], out: Path):
-    """Scatter: dark histogram variance (ADU²) vs gain (ISO/100), legend on the side."""
-    colors  = [COLORS[i % len(COLORS)] for i in range(len(results))]
-    gains   = [r["iso"] / 100.0 if r["iso"] else float("nan") for r in results]
-    adu_vars = [r["adu_var"] for r in results]
-    labels  = [r["label"] for r in results]
+    """Two-panel scatter: read noise σ vs gain (left) and σ² vs gain (right).
 
-    fig, ax = plt.subplots(figsize=(8, 5))
+    Read noise σ ∝ gain  → left panel should be linear.
+    Read noise σ² ∝ gain² → right panel should be quadratic.
+    Both use median per-pixel temporal σ (calibrated units).
+    Legend placed outside to the right.
+    """
+    colors = [COLORS[i % len(COLORS)] for i in range(len(results))]
+    gains  = [r["iso"] / 100.0 if r["iso"] else float("nan") for r in results]
+    sigmas = [r["median_noise"] for r in results]
+    vars_  = [s ** 2 for s in sigmas]
+    labels = [r["label"] for r in results]
+
+    fig, (ax_s, ax_v) = plt.subplots(1, 2, figsize=(12, 5))
     handles = []
-    for g, v, c, lbl in zip(gains, adu_vars, colors, labels):
-        h = ax.scatter(g, v, color=c, s=70, zorder=3, label=lbl)
+    for g, s, v, c, lbl in zip(gains, sigmas, vars_, colors, labels):
+        h = ax_s.scatter(g, s, color=c, s=70, zorder=3)
+        ax_v.scatter(g, v, color=c, s=70, zorder=3)
         handles.append(h)
 
-    ax.set_xlabel("Gain  (ISO / 100)", fontsize=10)
-    ax.set_ylabel("Dark histogram variance (ADU²)", fontsize=10)
-    ax.set_title("Dark variance vs gain", fontsize=12)
-    ax.grid(True, alpha=0.3, linestyle="--")
-    ax.legend(handles=handles, labels=labels,
-              fontsize=8, loc="upper left",
-              bbox_to_anchor=(1.01, 1), borderaxespad=0)
+    ax_s.set_xlabel("Gain  (ISO / 100)", fontsize=10)
+    ax_s.set_ylabel("Median read noise σ (calibrated)", fontsize=10)
+    ax_s.set_title("Read noise σ vs gain  (expect linear)", fontsize=11)
+    ax_s.grid(True, alpha=0.3, linestyle="--")
+
+    ax_v.set_xlabel("Gain  (ISO / 100)", fontsize=10)
+    ax_v.set_ylabel("Median read noise σ² (calibrated)", fontsize=10)
+    ax_v.set_title("Read noise variance vs gain  (expect quadratic)", fontsize=11)
+    ax_v.grid(True, alpha=0.3, linestyle="--")
+
+    fig.legend(handles=handles, labels=labels,
+               fontsize=8, loc="upper left",
+               bbox_to_anchor=(1.0, 1.0), borderaxespad=0)
+    fig.suptitle("Read noise vs gain — all conditions", fontsize=13)
     fig.tight_layout()
     fig.savefig(out, dpi=DPI, bbox_inches="tight")
     plt.close(fig)

@@ -32,6 +32,7 @@ OUTPUT_DIR       = "output_dark"
 HIST_BINS        = 512
 HIST_ADU_XMAX    = 500     # right x-axis limit for ADU histogram plots (ADU); None = auto
 HOT_PIXEL_NSIGMA = 5.0    # pixels > this many × median noise are flagged as hot
+AUTOCORR_LAGS    = 32     # ± pixels shown in 2D autocorrelation
 MAX_FRAMES       = None    # int to cap frames per subdir; None = all
 # ============================================================
 
@@ -332,6 +333,94 @@ def plot_fnp_profiles(mean_cal, title, out):
 
 
 # --------------------------------------------------------------------------- #
+# 2D autocorrelation of median frame                                             #
+# --------------------------------------------------------------------------- #
+
+def _compute_autocorr_2d(median_cal: np.ndarray, lags: int) -> np.ndarray:
+    """
+    FFT-based 2D spatial autocorrelation of the DC-subtracted median dark frame.
+    Returns a (2*lags+1) × (2*lags+1) array normalized to variance; lag-0 set to NaN.
+    """
+    frame = median_cal.astype(np.float64)
+    frame -= frame.mean()
+    power = np.abs(np.fft.rfft2(frame)) ** 2
+    full  = np.fft.irfft2(power, s=frame.shape)
+    centered = np.fft.fftshift(full)
+    H, W = centered.shape
+    cy, cx = H // 2, W // 2
+    norm = centered[cy, cx]
+    normalized = centered / max(norm, 1e-12)
+    crop = normalized[cy - lags : cy + lags + 1,
+                      cx - lags : cx + lags + 1].copy()
+    crop[lags, lags] = np.nan
+    return crop
+
+
+def plot_median_autocorr(autocorr: np.ndarray, title: str, out: Path):
+    """Heatmap of the 2D spatial autocorrelation of the median dark frame."""
+    lags = autocorr.shape[0] // 2
+    extent = [-lags - 0.5, lags + 0.5, -lags - 0.5, lags + 0.5]
+    vmax = max(float(np.nanmax(np.abs(autocorr))), 1e-6)
+
+    fig, ax = plt.subplots(figsize=(6, 6))
+    im = ax.imshow(autocorr, extent=extent, cmap="RdBu_r",
+                   vmin=-vmax, vmax=vmax, origin="lower",
+                   aspect="equal", interpolation="nearest")
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04,
+                 label="normalized correlation")
+    ax.axhline(0, color="k", linewidth=0.5, alpha=0.4)
+    ax.axvline(0, color="k", linewidth=0.5, alpha=0.4)
+    ax.set_xlabel("lag x (px)", fontsize=10)
+    ax.set_ylabel("lag y (px)", fontsize=10)
+    ax.set_title(title, fontsize=11)
+    ax.grid(True, alpha=0.3, linestyle="--")
+    fig.tight_layout()
+    fig.savefig(out, dpi=DPI, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved {out.name}")
+
+
+# --------------------------------------------------------------------------- #
+# Cross-condition FPN profile overlay                                            #
+# --------------------------------------------------------------------------- #
+
+def plot_fpn_profiles_overlay(results: list[dict], out: Path):
+    """
+    Overlay row- and column-averaged dark profiles across all conditions.
+    Each condition is one coloured line; legend on the right.
+    Profiles are from the median frame (robust FPN estimate).
+    """
+    fig, (ax_c, ax_r) = plt.subplots(2, 1, figsize=(12, 8))
+    handles = []
+    for i, r in enumerate(results):
+        color = COLORS[i % len(COLORS)]
+        med = r["median_cal"]
+        col_prof = med.mean(axis=0)
+        row_prof = med.mean(axis=1)
+        h, = ax_c.plot(col_prof, color=color, linewidth=0.8, alpha=0.85, label=r["label"])
+        ax_r.plot(row_prof, color=color, linewidth=0.8, alpha=0.85)
+        handles.append(h)
+
+    for ax, xlabel, title in [
+        (ax_c, "Column index", "Column FPN profile (median frame, all conditions)"),
+        (ax_r, "Row index",    "Row FPN profile (median frame, all conditions)"),
+    ]:
+        ax.set_xlabel(xlabel, fontsize=9)
+        ax.set_ylabel("Mean dark (calibrated)", fontsize=9)
+        ax.set_title(title, fontsize=10)
+        ax.grid(True, alpha=0.3, linestyle="--")
+
+    fig.legend(handles=handles, labels=[r["label"] for r in results],
+               fontsize=8, loc="upper left",
+               bbox_to_anchor=(1.0, 1.0), borderaxespad=0)
+    fig.suptitle("Fixed-pattern noise profiles — cross-condition overlay", fontsize=12)
+    fig.tight_layout()
+    fig.savefig(out, dpi=DPI, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved {out}")
+
+
+# --------------------------------------------------------------------------- #
 # Summary plot — across all conditions                                           #
 # --------------------------------------------------------------------------- #
 
@@ -503,6 +592,11 @@ def main():
                           title=f"Median dark frame — {t_suffix}",
                           out=sub_out / "median_frame.png")
 
+        autocorr = _compute_autocorr_2d(median_cal, AUTOCORR_LAGS)
+        plot_median_autocorr(autocorr,
+                             title=f"2D autocorrelation (median frame) — {t_suffix}",
+                             out=sub_out / "median_autocorr.png")
+
         plot_read_noise_map(var_cal,
                             title=f"Per-pixel read noise — {t_suffix}",
                             out=sub_out / "read_noise_map.png")
@@ -520,8 +614,8 @@ def main():
 
         results.append(dict(
             label=label, iso=iso,
-            mean_cal=mean_cal, median_noise=median_noise, n_hot=n_hot,
-            adu_var=adu_var,
+            mean_cal=mean_cal, median_cal=median_cal,
+            median_noise=median_noise, n_hot=n_hot, adu_var=adu_var,
         ))
 
     if not results:
@@ -530,6 +624,7 @@ def main():
     print(f"\n{'─'*60}")
     plot_summary(results, out_dir / "summary_all.png")
     plot_variance_vs_gain(results, out_dir / "variance_vs_gain.png")
+    plot_fpn_profiles_overlay(results, out_dir / "fpn_profiles_overlay.png")
     print(f"\nDone. All plots saved under: {out_dir.resolve()}/")
 
 

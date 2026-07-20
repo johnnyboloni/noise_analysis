@@ -172,16 +172,17 @@ def stream_dark(paths: list[Path], pattern: np.ndarray,
 
     Returns
     -------
-    mean_cal    : float32 (H, W)  — per-pixel temporal mean, calibrated [0,1]
-    var_cal     : float32 (H, W)  — per-pixel temporal variance, calibrated
-    frame_means : float64 (N,)    — per-frame spatial mean (for drift plot)
-    adu_counts  : int64 (HIST_BINS,)
-    adu_edges   : float64 (HIST_BINS+1,)
+    mean_cal   : float32 (H, W)
+    median_cal : float32 (H, W)  — per-pixel temporal median (robust to hot pixels)
+    var_cal    : float32 (H, W)
+    adu_counts : int64 (n_bins,)
+    adu_edges  : float64 (n_bins+1,)
     """
     n_bins     = int(white) + 1
-    adu_edges  = np.arange(0, white + 2, dtype=np.float64)  # one bin per ADU value
+    adu_edges  = np.arange(0, white + 2, dtype=np.float64)
     adu_counts = np.zeros(n_bins, dtype=np.int64)
     accum: np.ndarray | None = None
+    stack_mm:  np.ndarray | None = None   # memmap for median
 
     for i, p in enumerate(paths):
         print(f"  pass 1  [{i+1}/{len(paths)}] {p.name}", end="\r", flush=True)
@@ -189,10 +190,24 @@ def stream_dark(paths: list[Path], pattern: np.ndarray,
         h, _ = np.histogram(frame, bins=adu_edges)
         adu_counts += h
         cal = calibrate_frame(frame, pattern, black, white)
-        accum = cal.astype(np.float64) if accum is None else accum + cal
+        if accum is None:
+            accum = cal.astype(np.float64)
+            H, W = cal.shape
+            _mm_path = Path(OUTPUT_DIR) / "_dark_stack.npy"
+            stack_mm = np.lib.format.open_memmap(
+                str(_mm_path), mode="w+", dtype=np.float32, shape=(len(paths), H, W)
+            )
+        else:
+            accum += cal
+        stack_mm[i] = cal
     print()
 
     mean_cal = (accum / len(paths)).astype(np.float32)
+
+    print(f"  computing median frame …", flush=True)
+    median_cal = np.median(stack_mm, axis=0).astype(np.float32)
+    del stack_mm
+    _mm_path.unlink(missing_ok=True)
 
     var_accum: np.ndarray | None = None
 
@@ -204,7 +219,7 @@ def stream_dark(paths: list[Path], pattern: np.ndarray,
     print()
 
     var_cal = (var_accum / len(paths)).astype(np.float32)
-    return mean_cal, var_cal, adu_counts, adu_edges
+    return mean_cal, median_cal, var_cal, adu_counts, adu_edges
 
 
 # --------------------------------------------------------------------------- #
@@ -236,6 +251,21 @@ def plot_histogram_adu(adu_counts, adu_edges, black, title, out):
     ax.grid(True, alpha=0.3, linestyle="--")
     fig.tight_layout()
     fig.savefig(out, dpi=DPI)
+    plt.close(fig)
+    print(f"  Saved {out.name}")
+
+
+def plot_median_frame(median_cal, title, out):
+    """Heatmap of the per-pixel temporal median (robust fixed-pattern view)."""
+    fig, ax = plt.subplots(figsize=(8, 6))
+    p_lo, p_hi = np.percentile(median_cal, [1, 99])
+    im = ax.imshow(median_cal, cmap="gray", aspect="auto",
+                   vmin=p_lo, vmax=p_hi)
+    fig.colorbar(im, ax=ax, label="median dark (calibrated)")
+    ax.set_title(title, fontsize=12)
+    ax.axis("off")
+    fig.tight_layout()
+    fig.savefig(out, dpi=DPI, bbox_inches="tight")
     plt.close(fig)
     print(f"  Saved {out.name}")
 
@@ -452,7 +482,7 @@ def main():
         print(f"  {label}")
         print(f"  Black levels: {black}  White: {white:.0f}")
 
-        mean_cal, var_cal, adu_counts, adu_edges = stream_dark(
+        mean_cal, median_cal, var_cal, adu_counts, adu_edges = stream_dark(
             paths, pattern, black, white,
         )
 
@@ -468,6 +498,10 @@ def main():
         plot_histogram_adu(adu_counts, adu_edges, black,
                            title=f"Dark ADU histogram — {t_suffix}",
                            out=sub_out / "histogram_adu.png")
+
+        plot_median_frame(median_cal,
+                          title=f"Median dark frame — {t_suffix}",
+                          out=sub_out / "median_frame.png")
 
         plot_read_noise_map(var_cal,
                             title=f"Per-pixel read noise — {t_suffix}",

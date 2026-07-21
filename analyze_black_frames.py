@@ -191,31 +191,26 @@ def stream_dark(paths: list[Path], pattern: np.ndarray,
         h, _ = np.histogram(frame, bins=adu_edges)
         adu_counts += h
         cal = calibrate_frame(frame, pattern, black, white)
-        if accum is None:
-            accum = cal.astype(np.float64)
-            H, W = cal.shape
-            _mm_path = Path(OUTPUT_DIR) / "_dark_stack.npy"
-            stack_mm = np.lib.format.open_memmap(
-                str(_mm_path), mode="w+", dtype=np.float32, shape=(len(paths), H, W)
-            )
-        else:
-            accum += cal
-        stack_mm[i] = cal
+        accum = cal.astype(np.float64) if accum is None else accum + cal
     print()
 
     mean_cal = (accum / len(paths)).astype(np.float32)
+    H, W = mean_cal.shape
 
-    print(f"  computing median frame …", flush=True)
-    H, W = stack_mm.shape[1], stack_mm.shape[2]
+    # Median pass: column chunks loaded entirely in RAM to avoid disk writes.
+    # Each chunk holds (N × H × chunk_cols) float32 values, capped at ~512 MB.
+    chunk_cols = max(1, int(512 * 1024 * 1024 // (len(paths) * H * 4)))
+    n_chunks   = (W + chunk_cols - 1) // chunk_cols
     median_cal = np.empty((H, W), dtype=np.float32)
-    # process in column chunks to avoid loading the full stack into RAM
-    chunk = max(1, int(256 * 1024 * 1024 // (len(paths) * H * 4)))
-    for col in range(0, W, chunk):
-        median_cal[:, col:col+chunk] = np.median(
-            stack_mm[:, :, col:col+chunk], axis=0
-        )
-    del stack_mm
-    _mm_path.unlink(missing_ok=True)
+    for ci, col in enumerate(range(0, W, chunk_cols)):
+        col_end = min(col + chunk_cols, W)
+        print(f"  median [{ci+1}/{n_chunks}] cols {col}–{col_end} …", end="\r", flush=True)
+        buf = np.empty((len(paths), H, col_end - col), dtype=np.float32)
+        for i, p in enumerate(paths):
+            buf[i] = calibrate_frame(_load_frame(p), pattern, black, white)[:, col:col_end]
+        median_cal[:, col:col_end] = np.median(buf, axis=0)
+        del buf
+    print()
 
     var_accum: np.ndarray | None = None
 

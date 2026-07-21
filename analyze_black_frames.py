@@ -206,7 +206,14 @@ def stream_dark(paths: list[Path], pattern: np.ndarray,
     mean_cal = (accum / len(paths)).astype(np.float32)
 
     print(f"  computing median frame …", flush=True)
-    median_cal = np.median(stack_mm, axis=0).astype(np.float32)
+    H, W = stack_mm.shape[1], stack_mm.shape[2]
+    median_cal = np.empty((H, W), dtype=np.float32)
+    # process in column chunks to avoid loading the full stack into RAM
+    chunk = max(1, int(256 * 1024 * 1024 // (len(paths) * H * 4)))
+    for col in range(0, W, chunk):
+        median_cal[:, col:col+chunk] = np.median(
+            stack_mm[:, :, col:col+chunk], axis=0
+        )
     del stack_mm
     _mm_path.unlink(missing_ok=True)
 

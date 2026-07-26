@@ -27,7 +27,7 @@ import rawpy
 # ============================================================
 # CONFIG — edit paths and options here
 # ============================================================
-ROOT_DIR         = "/home/yonif/motioncam/decoded/"  # root containing one subdir per condition
+ROOT_DIR         = "/home/yonif/motioncam/s23_daniel/dng"  # root containing one subdir per condition
 OUTPUT_DIR       = "output_dark"
 HIST_BINS        = 512
 HIST_ADU_XMAX    = 500     # right x-axis limit for ADU histogram plots (ADU); None = auto

@@ -34,6 +34,7 @@ HIST_ADU_XMAX    = 500     # right x-axis limit for ADU histogram plots (ADU); N
 HOT_PIXEL_NSIGMA = 5.0    # pixels > this many × median noise are flagged as hot
 AUTOCORR_LAGS    = 32     # ± pixels shown in 2D autocorrelation
 MAX_FRAMES       = None    # int to cap frames per subdir; None = all
+READ_ISO_FROM_SIDECAR = True   # read ISO from <frame>.json sidecar; falls back to rawpy if missing
 # ============================================================
 
 COLORS = list(plt.cm.tab10.colors)
@@ -105,23 +106,19 @@ def get_dark_metadata(path: Path):
         pattern = raw.raw_pattern.copy()
         black   = np.array(raw.black_level_per_channel, dtype=np.float32)
         white   = float(raw.white_level)
-        try:
-            iso = int(raw.other_params.iso_speed)
-            if iso == 0:
-                iso = None
-        except Exception:
-            try:
-                iso = int(raw.camera_isoValue)
-                if iso == 0:
-                    iso = None
-            except Exception:
-                iso = None
+        iso = None
 
-    sidecar = path.with_suffix(".json")
-    if sidecar.exists():
+    if READ_ISO_FROM_SIDECAR:
+        sidecar = path.with_suffix(".json")
+        if sidecar.exists():
+            try:
+                import json
+                iso = int(json.loads(sidecar.read_text())["iso"])
+            except Exception:
+                pass
+    else:
         try:
-            import json
-            iso = int(json.loads(sidecar.read_text())["iso"])
+            iso = int(raw.other_params.iso_speed) or None
         except Exception:
             pass
 

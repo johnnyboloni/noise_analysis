@@ -106,9 +106,16 @@ def get_dark_metadata(path: Path):
         black   = np.array(raw.black_level_per_channel, dtype=np.float32)
         white   = float(raw.white_level)
         try:
-            iso = int(raw.camera_isoValue)
+            iso = int(raw.other_params.iso_speed)
+            if iso == 0:
+                iso = None
         except Exception:
-            iso = None
+            try:
+                iso = int(raw.camera_isoValue)
+                if iso == 0:
+                    iso = None
+            except Exception:
+                iso = None
 
     sidecar = path.with_suffix(".json")
     if sidecar.exists():

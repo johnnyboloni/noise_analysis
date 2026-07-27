@@ -33,6 +33,7 @@ HIST_BINS        = 512
 HIST_ADU_XMAX    = 500     # right x-axis limit for ADU histogram plots (ADU); None = auto
 HOT_PIXEL_NSIGMA = 5.0    # pixels > this many × median noise are flagged as hot
 AUTOCORR_LAGS    = 32     # ± pixels shown in 2D autocorrelation
+TRIM_RATIO       = 0.05   # fraction trimmed from each tail for the robust mean
 MAX_FRAMES       = None    # int to cap frames per subdir; None = all
 READ_ISO_FROM_SIDECAR = True   # read ISO from <frame>.json sidecar; falls back to rawpy if missing
 # ============================================================
@@ -175,10 +176,15 @@ def stream_dark(paths: list[Path], pattern: np.ndarray,
     """
     Two-pass streaming over dark DNG frames.
 
+    Pass 1 : ADU histogram only.
+    Chunk pass : sort each column chunk in time; derive both trimmed mean
+                 (TRIM_RATIO cut from each tail) and median in one sort.
+    Pass 2 : per-pixel variance using the trimmed mean as reference.
+
     Returns
     -------
-    mean_cal   : float32 (H, W)
-    median_cal : float32 (H, W)  — per-pixel temporal median (robust to hot pixels)
+    mean_cal   : float32 (H, W)  — trimmed mean (robust, replaces simple mean)
+    median_cal : float32 (H, W)  — per-pixel temporal median
     var_cal    : float32 (H, W)
     adu_counts : int64 (n_bins,)
     adu_edges  : float64 (n_bins+1,)
@@ -186,38 +192,48 @@ def stream_dark(paths: list[Path], pattern: np.ndarray,
     n_bins     = int(white) + 1
     adu_edges  = np.arange(0, white + 2, dtype=np.float64)
     adu_counts = np.zeros(n_bins, dtype=np.int64)
-    accum: np.ndarray | None = None
-    stack_mm:  np.ndarray | None = None   # memmap for median
+    H = W = None
 
     for i, p in enumerate(paths):
         print(f"  pass 1  [{i+1}/{len(paths)}] {p.name}", end="\r", flush=True)
         frame = _load_frame(p)
         h, _ = np.histogram(frame, bins=adu_edges)
         adu_counts += h
-        cal = calibrate_frame(frame, pattern, black, white)
-        accum = cal.astype(np.float64) if accum is None else accum + cal
+        if H is None:
+            cal = calibrate_frame(frame, pattern, black, white)
+            H, W = cal.shape
     print()
 
-    mean_cal = (accum / len(paths)).astype(np.float32)
-    H, W = mean_cal.shape
-
-    # Median pass: column chunks loaded entirely in RAM to avoid disk writes.
-    # Each chunk holds (N × H × chunk_cols) float32 values, capped at ~512 MB.
-    chunk_cols = max(1, int(512 * 1024 * 1024 // (len(paths) * H * 4)))
+    # Chunk pass — sort once, derive trimmed mean + median.
+    # Each chunk: (N × H × chunk_cols) float32, capped at ~512 MB.
+    T          = len(paths)
+    k          = max(0, int(round(T * TRIM_RATIO)))
+    chunk_cols = max(1, int(512 * 1024 * 1024 // (T * H * 4)))
     n_chunks   = (W + chunk_cols - 1) // chunk_cols
+    mean_cal   = np.empty((H, W), dtype=np.float32)
     median_cal = np.empty((H, W), dtype=np.float32)
+
     for ci, col in enumerate(range(0, W, chunk_cols)):
         col_end = min(col + chunk_cols, W)
-        print(f"  median [{ci+1}/{n_chunks}] cols {col}–{col_end} …", end="\r", flush=True)
-        buf = np.empty((len(paths), H, col_end - col), dtype=np.float32)
+        print(f"  sort chunk [{ci+1}/{n_chunks}] cols {col}–{col_end} …",
+              end="\r", flush=True)
+        buf = np.empty((T, H, col_end - col), dtype=np.float32)
         for i, p in enumerate(paths):
             buf[i] = calibrate_frame(_load_frame(p), pattern, black, white)[:, col:col_end]
-        median_cal[:, col:col_end] = np.median(buf, axis=0)
+        sorted_t = np.sort(buf, axis=0)
         del buf
+        # trimmed mean
+        core = sorted_t[k : T - k] if k > 0 else sorted_t
+        mean_cal[:, col:col_end] = np.mean(core, axis=0)
+        # median from already-sorted data
+        if T % 2 == 1:
+            median_cal[:, col:col_end] = sorted_t[T // 2]
+        else:
+            median_cal[:, col:col_end] = 0.5 * (sorted_t[T // 2 - 1] + sorted_t[T // 2])
+        del sorted_t, core
     print()
 
     var_accum: np.ndarray | None = None
-
     for i, p in enumerate(paths):
         print(f"  pass 2  [{i+1}/{len(paths)}] {p.name}", end="\r", flush=True)
         cal = calibrate_frame(_load_frame(p), pattern, black, white)

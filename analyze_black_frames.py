@@ -464,8 +464,9 @@ def plot_fpn_profiles_overlay(results: list[dict], out: Path):
 # Cross-condition summary plots                                                  #
 # --------------------------------------------------------------------------- #
 
-def plot_median_stats_vs_gain(results: list[dict], out: Path):
-    """Per-condition median-frame statistics (mean, std, percentiles) vs ISO."""
+def plot_frame_stats_vs_gain(results: list[dict], adu_key: str,
+                              title: str, out: Path):
+    """Per-condition frame statistics (mean, std, percentiles) vs ISO."""
     isos   = [r["iso"] or float("nan") for r in results]
     labels = [r["label"] for r in results]
     colors = [COLORS[i % len(COLORS)] for i in range(len(results))]
@@ -478,7 +479,7 @@ def plot_median_stats_vs_gain(results: list[dict], out: Path):
         ("p95",   lambda a: float(np.percentile(a, 95))),
         ("p99",   lambda a: float(np.percentile(a, 99))),
     ]:
-        stats[key] = [fn(r["median_adu"]) for r in results]
+        stats[key] = [fn(r[adu_key]) for r in results]
 
     fig, axes = plt.subplots(1, 5, figsize=(20, 4))
     for ax, (key, vals) in zip(axes, stats.items()):
@@ -486,51 +487,54 @@ def plot_median_stats_vs_gain(results: list[dict], out: Path):
             ax.scatter(iso, v, color=c, s=70, zorder=3, label=lbl)
         ax.set_xlabel("ISO", fontsize=9)
         ax.set_ylabel(f"{key}  (ADU)", fontsize=9)
-        ax.set_title(f"Median frame {key} vs ISO", fontsize=10)
+        ax.set_title(f"{key} vs ISO", fontsize=10)
         ax.grid(True, alpha=0.3, linestyle="--")
 
     handles = [plt.scatter([], [], color=c, s=50) for c in colors]
     fig.legend(handles, labels, fontsize=7, loc="upper left",
                bbox_to_anchor=(1.0, 1.0), borderaxespad=0)
-    fig.suptitle("Median frame statistics vs gain", fontsize=12)
+    fig.suptitle(title, fontsize=12)
     fig.tight_layout()
     fig.savefig(out, dpi=DPI, bbox_inches="tight")
     plt.close(fig)
     print(f"Saved {out}")
 
 
-def plot_difference_frames(results: list[dict], out_dir: Path):
+def plot_difference_frames(results: list[dict], adu_key: str,
+                           label: str, out_dir: Path):
     """
-    Difference of each condition's median ADU frame from the lowest-ISO base.
+    Difference of each condition's frame from the lowest-ISO base.
     Saves a PNG heatmap per condition (skips the base itself).
     """
     valid = [r for r in results if r["iso"] is not None]
     if len(valid) < 2:
-        print("  difference frames: need ≥2 conditions with known ISO — skipped")
+        print(f"  difference frames ({label}): need ≥2 conditions with known ISO — skipped")
         return
-    base = min(valid, key=lambda r: r["iso"])
-    base_frame = base["median_adu"].astype(np.float32)
+    base       = min(valid, key=lambda r: r["iso"])
+    base_frame = base[adu_key].astype(np.float32)
 
     for r in valid:
         if r is base:
             continue
-        diff = r["median_adu"].astype(np.float32) - base_frame
+        diff = r[adu_key].astype(np.float32) - base_frame
         vmax = max(float(np.percentile(np.abs(diff), 99)), 1.0)
         fig, ax = plt.subplots(figsize=(8, 6))
         im = ax.imshow(diff, cmap="RdBu_r", aspect="auto",
                        vmin=-vmax, vmax=vmax)
         fig.colorbar(im, ax=ax, label="ΔADU")
         ax.set_title(
-            f"Median frame diff: {r['label']} − {base['label']}", fontsize=11)
+            f"{label} diff: {r['label']} − {base['label']}", fontsize=11)
         ax.axis("off")
         fig.tight_layout()
-        fname = out_dir / f"diff_{r['label'].split()[0]}_minus_{base['label'].split()[0]}.png"
+        slug = label.lower().replace(" ", "_")
+        fname = out_dir / f"diff_{slug}_{r['label'].split()[0]}_minus_{base['label'].split()[0]}.png"
         fig.savefig(fname, dpi=DPI, bbox_inches="tight")
         plt.close(fig)
         print(f"Saved {fname.name}")
 
 
-def plot_normalized_profiles_overlay(results: list[dict], out: Path):
+def plot_normalized_profiles_overlay(results: list[dict], cal_key: str,
+                                     title: str, out: Path):
     """
     Column and row FPN profiles, each divided by its own mean before overlaying.
     Shape consistency across ISO = gain-proportional FPN; shape change = not.
@@ -538,48 +542,49 @@ def plot_normalized_profiles_overlay(results: list[dict], out: Path):
     fig, (ax_c, ax_r) = plt.subplots(2, 1, figsize=(12, 8))
     handles = []
     for i, r in enumerate(results):
-        color = COLORS[i % len(COLORS)]
-        med   = r["median_cal"]
-        col_prof = med.mean(axis=0)
-        row_prof = med.mean(axis=1)
+        color    = COLORS[i % len(COLORS)]
+        frame    = r[cal_key]
+        col_prof = frame.mean(axis=0)
+        row_prof = frame.mean(axis=1)
         col_norm = col_prof / col_prof.mean() if col_prof.mean() != 0 else col_prof
         row_norm = row_prof / row_prof.mean() if row_prof.mean() != 0 else row_prof
         h, = ax_c.plot(col_norm, color=color, linewidth=0.8, alpha=0.85, label=r["label"])
         ax_r.plot(row_norm, color=color, linewidth=0.8, alpha=0.85)
         handles.append(h)
 
-    for ax, xlabel, title in [
+    for ax, xlabel, ax_title in [
         (ax_c, "Column index", "Normalised column FPN profile (÷ mean)"),
         (ax_r, "Row index",    "Normalised row FPN profile (÷ mean)"),
     ]:
         ax.axhline(1.0, color="k", linewidth=0.6, linestyle="--", alpha=0.4)
         ax.set_xlabel(xlabel, fontsize=9)
         ax.set_ylabel("Relative dark level", fontsize=9)
-        ax.set_title(title, fontsize=10)
+        ax.set_title(ax_title, fontsize=10)
         ax.grid(True, alpha=0.3, linestyle="--")
 
     fig.legend(handles=handles, labels=[r["label"] for r in results],
                fontsize=8, loc="upper left",
                bbox_to_anchor=(1.0, 1.0), borderaxespad=0)
-    fig.suptitle("Normalised FPN profiles — cross-condition overlay", fontsize=12)
+    fig.suptitle(title, fontsize=12)
     fig.tight_layout()
     fig.savefig(out, dpi=DPI, bbox_inches="tight")
     plt.close(fig)
     print(f"Saved {out}")
 
 
-def plot_correlation_matrix(results: list[dict], out: Path):
+def plot_correlation_matrix(results: list[dict], adu_key: str,
+                             title: str, out: Path):
     """
-    Pairwise Pearson correlation of flattened median ADU frames.
+    Pairwise Pearson correlation of flattened ADU frames.
     Values near 1 = consistent spatial pattern; lower = pattern diverges.
     """
     n      = len(results)
     labels = [r["label"] for r in results]
     mat    = np.eye(n)
     for i in range(n):
-        a = results[i]["median_adu"].ravel().astype(np.float64)
+        a = results[i][adu_key].ravel().astype(np.float64)
         for j in range(i + 1, n):
-            b  = results[j]["median_adu"].ravel().astype(np.float64)
+            b  = results[j][adu_key].ravel().astype(np.float64)
             cc = float(np.corrcoef(a, b)[0, 1])
             mat[i, j] = mat[j, i] = cc
 
@@ -594,7 +599,7 @@ def plot_correlation_matrix(results: list[dict], out: Path):
         for j in range(n):
             ax.text(j, i, f"{mat[i,j]:.3f}", ha="center", va="center",
                     fontsize=7, color="black")
-    ax.set_title("Median frame pairwise correlation", fontsize=12)
+    ax.set_title(title, fontsize=12)
     fig.tight_layout()
     fig.savefig(out, dpi=DPI, bbox_inches="tight")
     plt.close(fig)
@@ -804,7 +809,7 @@ def main():
         results.append(dict(
             label=label, iso=iso,
             mean_cal=mean_cal, median_cal=median_cal,
-            median_adu=median_adu,
+            mean_adu=mean_adu, median_adu=median_adu,
             median_noise=median_noise, n_hot=n_hot, adu_var=adu_var,
         ))
 
@@ -815,10 +820,27 @@ def main():
     plot_summary(results, out_dir / "summary_all.png")
     plot_variance_vs_gain(results, out_dir / "variance_vs_gain.png")
     plot_fpn_profiles_overlay(results, out_dir / "fpn_profiles_overlay.png")
-    plot_median_stats_vs_gain(results, out_dir / "median_stats_vs_gain.png")
-    plot_difference_frames(results, out_dir)
-    plot_normalized_profiles_overlay(results, out_dir / "normalized_profiles_overlay.png")
-    plot_correlation_matrix(results, out_dir / "median_correlation_matrix.png")
+
+    for adu_key, cal_key, tag in [
+        ("median_adu", "median_cal", "median"),
+        ("mean_adu",   "mean_cal",   "trimmed_mean"),
+    ]:
+        plot_frame_stats_vs_gain(
+            results, adu_key,
+            title=f"{tag.replace('_', ' ').title()} frame statistics vs gain",
+            out=out_dir / f"{tag}_stats_vs_gain.png")
+        plot_difference_frames(
+            results, adu_key,
+            label=tag.replace("_", " ").title(),
+            out_dir=out_dir)
+        plot_normalized_profiles_overlay(
+            results, cal_key,
+            title=f"Normalised FPN profiles ({tag.replace('_', ' ')}) — cross-condition overlay",
+            out=out_dir / f"normalized_profiles_{tag}.png")
+        plot_correlation_matrix(
+            results, adu_key,
+            title=f"Pairwise correlation — {tag.replace('_', ' ')} frames",
+            out=out_dir / f"correlation_matrix_{tag}.png")
     print(f"\nDone. All plots saved under: {out_dir.resolve()}/")
 
 

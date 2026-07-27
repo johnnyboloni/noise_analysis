@@ -210,8 +210,8 @@ def stream_dark(paths: list[Path], pattern: np.ndarray,
     k          = max(0, int(round(T * TRIM_RATIO)))
     chunk_cols = max(1, int(512 * 1024 * 1024 // (T * H * 4)))
     n_chunks   = (W + chunk_cols - 1) // chunk_cols
-    mean_cal   = np.empty((H, W), dtype=np.float32)
-    median_cal = np.empty((H, W), dtype=np.float32)
+    mean_adu   = np.empty((H, W), dtype=np.float32)
+    median_adu = np.empty((H, W), dtype=np.float32)
 
     for ci, col in enumerate(range(0, W, chunk_cols)):
         col_end = min(col + chunk_cols, W)
@@ -219,19 +219,22 @@ def stream_dark(paths: list[Path], pattern: np.ndarray,
               end="\r", flush=True)
         buf = np.empty((T, H, col_end - col), dtype=np.float32)
         for i, p in enumerate(paths):
-            buf[i] = calibrate_frame(_load_frame(p), pattern, black, white)[:, col:col_end]
+            buf[i] = _load_frame(p)[:, col:col_end]  # raw ADU
         sorted_t = np.sort(buf, axis=0)
         del buf
-        # trimmed mean
+        # trimmed mean (raw ADU)
         core = sorted_t[k : T - k] if k > 0 else sorted_t
-        mean_cal[:, col:col_end] = np.mean(core, axis=0)
-        # median from already-sorted data
+        mean_adu[:, col:col_end] = np.mean(core, axis=0)
+        # median from already-sorted data (raw ADU)
         if T % 2 == 1:
-            median_cal[:, col:col_end] = sorted_t[T // 2]
+            median_adu[:, col:col_end] = sorted_t[T // 2]
         else:
-            median_cal[:, col:col_end] = 0.5 * (sorted_t[T // 2 - 1] + sorted_t[T // 2])
+            median_adu[:, col:col_end] = 0.5 * (sorted_t[T // 2 - 1] + sorted_t[T // 2])
         del sorted_t, core
     print()
+
+    mean_cal   = calibrate_frame(mean_adu,   pattern, black, white)
+    median_cal = calibrate_frame(median_adu, pattern, black, white)
 
     var_accum: np.ndarray | None = None
     for i, p in enumerate(paths):
@@ -242,7 +245,7 @@ def stream_dark(paths: list[Path], pattern: np.ndarray,
     print()
 
     var_cal = (var_accum / len(paths)).astype(np.float32)
-    return mean_cal, median_cal, var_cal, adu_counts, adu_edges
+    return mean_cal, median_cal, mean_adu, median_adu, var_cal, adu_counts, adu_edges
 
 
 # --------------------------------------------------------------------------- #
@@ -608,7 +611,7 @@ def main():
         print(f"  {label}")
         print(f"  Black levels: {black}  White: {white:.0f}")
 
-        mean_cal, median_cal, var_cal, adu_counts, adu_edges = stream_dark(
+        mean_cal, median_cal, mean_adu, median_adu, var_cal, adu_counts, adu_edges = stream_dark(
             paths, pattern, black, white,
         )
 
@@ -633,9 +636,9 @@ def main():
                           title=f"Median dark frame — {t_suffix}",
                           out=sub_out / "median_frame.png")
 
-        np.save(sub_out / "mean_frame.npy",   mean_cal)
-        np.save(sub_out / "median_frame.npy", median_cal)
-        print(f"  Saved mean_frame.npy, median_frame.npy")
+        np.save(sub_out / "mean_frame.npy",   mean_adu)
+        np.save(sub_out / "median_frame.npy", median_adu)
+        print(f"  Saved mean_frame.npy, median_frame.npy  (raw ADU, float32)")
 
         autocorr = _compute_autocorr_2d(median_cal, AUTOCORR_LAGS)
         plot_median_autocorr(autocorr,

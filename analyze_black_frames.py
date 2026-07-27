@@ -278,6 +278,21 @@ def plot_histogram_adu(adu_counts, adu_edges, black, title, out):
     print(f"  Saved {out.name}")
 
 
+def plot_mean_frame(mean_cal, title, out):
+    """Heatmap of the per-pixel trimmed mean."""
+    fig, ax = plt.subplots(figsize=(8, 6))
+    p_lo, p_hi = np.percentile(mean_cal, [1, 99])
+    im = ax.imshow(mean_cal, cmap="gray", aspect="auto",
+                   vmin=p_lo, vmax=p_hi)
+    fig.colorbar(im, ax=ax, label="trimmed mean dark (calibrated)")
+    ax.set_title(title, fontsize=12)
+    ax.axis("off")
+    fig.tight_layout()
+    fig.savefig(out, dpi=DPI, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved {out.name}")
+
+
 def plot_median_frame(median_cal, title, out):
     """Heatmap of the per-pixel temporal median (robust fixed-pattern view)."""
     fig, ax = plt.subplots(figsize=(8, 6))
@@ -610,9 +625,17 @@ def main():
                            title=f"Dark ADU histogram — {t_suffix}",
                            out=sub_out / "histogram_adu.png")
 
+        plot_mean_frame(mean_cal,
+                        title=f"Trimmed mean dark frame — {t_suffix}",
+                        out=sub_out / "mean_frame.png")
+
         plot_median_frame(median_cal,
                           title=f"Median dark frame — {t_suffix}",
                           out=sub_out / "median_frame.png")
+
+        np.save(sub_out / "mean_frame.npy",   mean_cal)
+        np.save(sub_out / "median_frame.npy", median_cal)
+        print(f"  Saved mean_frame.npy, median_frame.npy")
 
         autocorr = _compute_autocorr_2d(median_cal, AUTOCORR_LAGS)
         plot_median_autocorr(autocorr,

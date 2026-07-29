@@ -3,7 +3,7 @@ Batch-decode .mcraw files using the motioncam-decoder example binary.
 
 For each .mcraw found under INPUT_DIR the script:
   1. Creates  OUTPUT_ROOT/<stem>/
-  2. Runs     EXAMPLE_BIN  <file>  <out_subdir>  [--num-frames N]
+  2. Runs     DECODER_BIN  <file>  -o <out_subdir>  [--num-frames N]
   3. Counts resulting .dng files as a sanity check
   4. Exits non-zero if any file fails
 
@@ -24,7 +24,7 @@ from pathlib import Path
 # ============================================================
 INPUT_DIR   = "/path/to/mcraw/files"   # searched recursively for *.mcraw
 OUTPUT_ROOT = "/path/to/output"        # one subdir per capture created here
-EXAMPLE_BIN = "example"               # path to motioncam-decoder example binary
+DECODER_BIN = "decoder"               # path to motioncam-decoder binary
 NUM_FRAMES  = None                     # int to decode only first N frames; None = all
 # ============================================================
 
@@ -87,7 +87,7 @@ def decode_one(mcraw: Path, out_dir: Path) -> int:
     """
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    cmd = [EXAMPLE_BIN, str(mcraw), str(out_dir)]
+    cmd = [DECODER_BIN, str(mcraw), "-o", str(out_dir)]
     if NUM_FRAMES is not None:
         cmd += ["--num-frames", str(NUM_FRAMES)]
 
@@ -132,7 +132,7 @@ def main() -> None:
 
     print(f"Found {len(mcraw_files)} .mcraw file(s) in {input_dir}")
     print(f"Output root : {output_root}")
-    print(f"Decoder     : {EXAMPLE_BIN}")
+    print(f"Decoder     : {DECODER_BIN}")
     if NUM_FRAMES is not None:
         print(f"Frame cap   : {NUM_FRAMES}")
     print()

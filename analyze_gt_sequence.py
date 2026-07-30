@@ -76,15 +76,20 @@ def _make_loaders(directory: str):
 # --------------------------------------------------------------------------- #
 
 def _stream_mean(paths, pattern, black, white, loader):
-    """Pass 1 — compute per-pixel calibrated mean, streaming one frame at a time."""
+    """Pass 1 — compute per-pixel calibrated mean, streaming one frame at a time.
+
+    Accumulates raw ADU in float64 so sub-black noise cancels across frames,
+    then calibrates (and clips) the final mean once.
+    """
     accum = None
     n = len(paths)
     for i, p in enumerate(paths):
         print(f"  mean  [{i+1}/{n}] {p.name}", end="\r", flush=True)
-        cal   = calibrate_frame(loader(p), pattern, black, white)
-        accum = cal.astype(np.float64) if accum is None else accum + cal
+        raw   = loader(p).astype(np.float64)
+        accum = raw if accum is None else accum + raw
     print()
-    return (accum / n).astype(np.float32)
+    mean_adu = (accum / n).astype(np.float32)
+    return calibrate_frame(mean_adu, pattern, black, white)
 
 
 def _stream_welford_and_convergence(paths, pattern, black, white, loader,

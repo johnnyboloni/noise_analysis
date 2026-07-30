@@ -12,6 +12,7 @@ Outputs (saved to OUTPUT_DIR):
   - gt_convergence.png     : RMS vs N frames (log-log) with 1/√N reference
 """
 
+import argparse
 import json
 import sys
 from pathlib import Path
@@ -289,10 +290,59 @@ def analyze_gt_sequence(
 
 
 # --------------------------------------------------------------------------- #
-# Entry point                                                                   #
+# CLI overrides + entry point                                                   #
 # --------------------------------------------------------------------------- #
 
+def _none_or_auto(s: str):
+    """argparse type for config values that can be None or a scalar."""
+    if s.lower() == 'none':
+        return None
+    try:
+        return int(s)
+    except ValueError:
+        pass
+    try:
+        return float(s)
+    except ValueError:
+        pass
+    return s
+
+
+def _apply_cli_overrides() -> None:
+    """Override any ALL_CAPS scalar config constant via a matching --lower-kebab-case flag."""
+    g = globals()
+    scalar = (bool, int, float, str, type(None))
+    keys = sorted(k for k in g if k.isupper() and not k.startswith('_') and isinstance(g[k], scalar))
+
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    for key in keys:
+        val = g[key]
+        flag = '--' + key.lower().replace('_', '-')
+        if isinstance(val, bool):
+            parser.add_argument(flag, dest=key, default=None,
+                                action=argparse.BooleanOptionalAction,
+                                help=f"(default: {val})")
+        elif isinstance(val, int):
+            parser.add_argument(flag, dest=key, type=int, default=None, metavar='N',
+                                help=f"(default: {val})")
+        elif isinstance(val, float):
+            parser.add_argument(flag, dest=key, type=float, default=None, metavar='F',
+                                help=f"(default: {val})")
+        else:  # str or None
+            parser.add_argument(flag, dest=key, type=_none_or_auto, default=None, metavar='S',
+                                help=f"(default: {val!r}; pass 'none' to clear)")
+
+    args = parser.parse_args()
+    for key, new_val in vars(args).items():
+        if new_val is not None:
+            g[key] = new_val
+
+
 def main():
+    _apply_cli_overrides()
     print(f"GT sequence analysis: {SEQUENCE_DIR}")
     analyze_gt_sequence(
         SEQUENCE_DIR,

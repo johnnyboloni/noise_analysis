@@ -116,7 +116,8 @@ def _stream_welford_and_convergence(paths, pattern, black, white, loader,
     for i, p in enumerate(paths):
         idx = i + 1
         print(f"  Welford  [{idx}/{n}] {p.name}", end="\r", flush=True)
-        cal = calibrate_frame(loader(p), pattern, black, white).astype(np.float64)
+        raw = loader(p).astype(np.float64)
+        cal = calibrate_frame(raw.astype(np.float32), pattern, black, white).astype(np.float64)
 
         if wf_mean is None:
             wf_mean = cal.copy()
@@ -126,9 +127,11 @@ def _stream_welford_and_convergence(paths, pattern, black, white, loader,
             wf_mean += delta / idx
             wf_M2   += delta * (cal - wf_mean)
 
-        run_sum = cal.copy() if run_sum is None else run_sum + cal
+        # Convergence: accumulate raw ADU so comparison with full_mean (also from raw ADU)
+        # is not biased by per-frame clipping.
+        run_sum = raw if run_sum is None else run_sum + raw
         if idx in checkpoints:
-            running = (run_sum / idx).astype(np.float32)
+            running = calibrate_frame((run_sum / idx).astype(np.float32), pattern, black, white)
             rms = float(np.sqrt(np.mean((running - full_mean) ** 2)))
             convergence.append((idx, rms))
 
@@ -285,7 +288,7 @@ def analyze_gt_sequence(
     out_dir.mkdir(parents=True, exist_ok=True)
 
     fmt, paths, pattern, black, white, loader, sample_fn = _make_loaders(directory)
-    if max_frames:
+    if max_frames is not None:
         paths = paths[:max_frames]
     n = len(paths)
     print(f"  {n} {fmt.upper()} frames  |  white={white}  black={black[0]}")
@@ -351,6 +354,9 @@ def _none_or_auto(s: str):
     return s
 
 
+_UNSET = object()  # sentinel: distinguishes "user passed --foo none" from "flag not given"
+
+
 def _apply_cli_overrides() -> None:
     """Override any ALL_CAPS scalar config constant via a matching --lower-kebab-case flag."""
     g = globals()
@@ -365,22 +371,22 @@ def _apply_cli_overrides() -> None:
         val = g[key]
         flag = '--' + key.lower().replace('_', '-')
         if isinstance(val, bool):
-            parser.add_argument(flag, dest=key, default=None,
+            parser.add_argument(flag, dest=key, default=_UNSET,
                                 action=argparse.BooleanOptionalAction,
                                 help=f"(default: {val})")
         elif isinstance(val, int):
-            parser.add_argument(flag, dest=key, type=int, default=None, metavar='N',
+            parser.add_argument(flag, dest=key, type=int, default=_UNSET, metavar='N',
                                 help=f"(default: {val})")
         elif isinstance(val, float):
-            parser.add_argument(flag, dest=key, type=float, default=None, metavar='F',
+            parser.add_argument(flag, dest=key, type=float, default=_UNSET, metavar='F',
                                 help=f"(default: {val})")
         else:  # str or None
-            parser.add_argument(flag, dest=key, type=_none_or_auto, default=None, metavar='S',
+            parser.add_argument(flag, dest=key, type=_none_or_auto, default=_UNSET, metavar='S',
                                 help=f"(default: {val!r}; pass 'none' to clear)")
 
     args = parser.parse_args()
     for key, new_val in vars(args).items():
-        if new_val is not None:
+        if new_val is not _UNSET:
             g[key] = new_val
 
 

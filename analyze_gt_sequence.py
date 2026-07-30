@@ -9,6 +9,8 @@ Outputs (saved to OUTPUT_DIR):
   - gt_aggregated.png      : mean / median / trimmed-mean side-by-side (RGB)
   - gt_differences.png     : (mean−median), (mean−trimmed), (median−trimmed) heatmaps
   - gt_temporal_noise.png  : per-pixel temporal std heatmap (noise map)
+  - gt_noise_cv.png        : σ/μ — coefficient of variation (relative noise)
+  - gt_noise_shot_norm.png : σ/√μ — deviation from shot-noise-limited (1 = pure Poisson)
   - gt_convergence.png     : RMS vs N frames (log-log) with 1/√N reference
 """
 
@@ -258,6 +260,38 @@ def _plot_temporal_noise(temporal_std, out):
     print(f"Saved {out}")
 
 
+def _plot_noise_cv(temporal_std, full_mean, out):
+    """σ/μ — coefficient of variation; removes signal-level dependence."""
+    mask = full_mean > 1e-4
+    cv = np.where(mask, temporal_std / np.where(mask, full_mean, 1.0), np.nan)
+    fig, ax = plt.subplots(figsize=(9, 6))
+    vmax = float(np.nanpercentile(cv, 99))
+    im = ax.imshow(cv, cmap="inferno", vmin=0, vmax=vmax, aspect="auto")
+    ax.set_title("Coefficient of variation  σ/μ  (relative noise per pixel)", fontsize=11)
+    ax.axis("off")
+    fig.colorbar(im, ax=ax, fraction=0.02, pad=0.02, label="σ/μ")
+    fig.tight_layout()
+    fig.savefig(out, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved {out}")
+
+
+def _plot_noise_shot_norm(temporal_std, full_mean, out):
+    """σ/√μ — shot-noise-normalized std; equals ~1 for pure Poisson noise."""
+    mask = full_mean > 1e-4
+    shot_norm = np.where(mask, temporal_std / np.where(mask, np.sqrt(full_mean), 1.0), np.nan)
+    fig, ax = plt.subplots(figsize=(9, 6))
+    vmax = float(np.nanpercentile(shot_norm, 99))
+    im = ax.imshow(shot_norm, cmap="inferno", vmin=0, vmax=vmax, aspect="auto")
+    ax.set_title("Shot-noise-normalized std  σ/√μ  (1 = pure shot noise)", fontsize=11)
+    ax.axis("off")
+    fig.colorbar(im, ax=ax, fraction=0.02, pad=0.02, label="σ/√μ")
+    fig.tight_layout()
+    fig.savefig(out, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved {out}")
+
+
 def _plot_convergence(convergence, out):
     ns  = np.array([c[0] for c in convergence], dtype=float)
     rms = np.array([c[1] for c in convergence], dtype=float)
@@ -337,7 +371,9 @@ def analyze_gt_sequence(
     _plot_differences(full_mean, median_frame, trimmed_frame,
                       out_dir / "gt_differences.png")
     _plot_temporal_noise(temporal_std, out_dir / "gt_temporal_noise.png")
-    _plot_convergence(convergence,     out_dir / "gt_convergence.png")
+    _plot_noise_cv(temporal_std, full_mean,       out_dir / "gt_noise_cv.png")
+    _plot_noise_shot_norm(temporal_std, full_mean, out_dir / "gt_noise_shot_norm.png")
+    _plot_convergence(convergence,                out_dir / "gt_convergence.png")
 
     # Full-resolution RGB saves (one file per aggregation method)
     print("  Saving full-resolution RGB frames …")

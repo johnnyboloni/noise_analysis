@@ -183,6 +183,11 @@ def demosaic_to_rgb(bayer: np.ndarray, pattern: np.ndarray) -> np.ndarray:
     for i in range(3):
         lo, hi = np.percentile(rgb[..., i], [0.5, 99.5])
         rgb[..., i] = np.clip((rgb[..., i] - lo) / max(hi - lo, 1e-6), 0, 1)
+
+    # Sensor data is linear in scene light; sRGB display expects gamma-encoded
+    # values, or the image looks dark and flat (rawpy's postprocess applies
+    # this internally for the DNG path, but this cv2/manual path never did).
+    rgb = rgb ** (1.0 / 2.2)
     return rgb
 
 

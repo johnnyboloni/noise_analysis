@@ -132,15 +132,58 @@ def _stream_welford_and_convergence(paths, pattern, black, white, loader,
     return np.sqrt(var), convergence
 
 
-def _load_calibrated_stack(paths, n_stack, pattern, black, white, loader):
-    """Load up to n_stack frames into a (N, H, W) float32 array."""
-    chosen = paths[:n_stack]
-    frames = []
-    for i, p in enumerate(chosen):
-        print(f"  stack  [{i+1}/{len(chosen)}] {p.name}", end="\r", flush=True)
-        frames.append(calibrate_frame(loader(p), pattern, black, white))
+def _compute_median_and_trimmed(paths, n_stack, pattern, black, white, loader,
+                                trim_frac, tmp_path):
+    """
+    Compute per-pixel median and trimmed mean without loading the full stack
+    into RAM.  Strategy:
+      1. Write calibrated frames one-by-one to a disk-backed (N, H, W) memmap.
+      2. Process the memmap in horizontal strips; each strip fits comfortably
+         in RAM.  Peak extra RAM ≈ one strip = ~200 MB.
+      3. Delete the temporary file on exit.
+    """
+    n = min(n_stack, len(paths))
+
+    # Prime with first frame to get shape
+    first = calibrate_frame(loader(paths[0]), pattern, black, white)
+    H, W  = first.shape
+
+    # Write all frames to the memmap
+    mm = np.lib.format.open_memmap(str(tmp_path), mode='w+',
+                                   dtype=np.float32, shape=(n, H, W))
+    mm[0] = first
+    del first
+    for i in range(1, n):
+        print(f"  stack [{i+1}/{n}] {paths[i].name}", end="\r", flush=True)
+        mm[i] = calibrate_frame(loader(paths[i]), pattern, black, white)
+    mm.flush()
     print()
-    return np.stack(frames, axis=0)
+
+    trim_k      = max(1, int(trim_frac / 2 * n))
+    median_out  = np.empty((H, W), dtype=np.float32)
+    trimmed_out = np.empty((H, W), dtype=np.float32)
+
+    # Strip height that keeps each in-RAM strip ≈ 200 MB
+    strip_h = max(1, int(200 * 1024 ** 2 // (n * W * 4)))
+
+    for r0 in range(0, H, strip_h):
+        r1    = min(r0 + strip_h, H)
+        strip = mm[:, r0:r1, :].copy()     # (n, strip_h, W) — the only big alloc
+        srt   = np.sort(strip, axis=0)
+        del strip
+
+        if n % 2 == 1:
+            median_out[r0:r1] = srt[n // 2]
+        else:
+            median_out[r0:r1] = (srt[n // 2 - 1] + srt[n // 2]) / 2
+
+        trimmed_out[r0:r1] = srt[trim_k : n - trim_k].mean(axis=0)
+        del srt
+
+    del mm
+    tmp_path.unlink(missing_ok=True)
+
+    return median_out, trimmed_out
 
 
 # --------------------------------------------------------------------------- #
@@ -262,20 +305,15 @@ def analyze_gt_sequence(
     )
     print(f"  Temporal std  mean={temporal_std.mean():.5f}  max={temporal_std.max():.5f}")
 
-    # Stack: median + trimmed mean
-    n_stack = min(max_stack, n)
-    if n_stack < n:
-        print(f"  Loading {n_stack}/{n} frames for median / trimmed-mean …")
-    stack = _load_calibrated_stack(paths, n_stack, pattern, black, white, loader)
-
-    print("  Computing median …")
-    median_frame = np.median(stack, axis=0).astype(np.float32)
-
-    trim_k = max(1, int(TRIM_FRAC / 2 * n_stack))
-    print(f"  Computing trimmed mean (removing {trim_k} from each tail) …")
-    sorted_stack  = np.sort(stack, axis=0)
-    trimmed_frame = sorted_stack[trim_k : n_stack - trim_k].mean(axis=0).astype(np.float32)
-    del stack, sorted_stack
+    # Median + trimmed mean (disk-backed, no full-stack RAM alloc)
+    n_stack  = min(max_stack, n)
+    tmp_path = out_dir / "_stack_tmp.npy"
+    trim_k   = max(1, int(TRIM_FRAC / 2 * n_stack))
+    print(f"  Writing {n_stack}/{n} frames to disk, then computing "
+          f"median and trimmed mean (trim_k={trim_k}) …")
+    median_frame, trimmed_frame = _compute_median_and_trimmed(
+        paths, n_stack, pattern, black, white, loader, TRIM_FRAC, tmp_path,
+    )
 
     # Plots
     print("  Plotting …")

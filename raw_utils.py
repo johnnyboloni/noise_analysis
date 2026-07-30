@@ -147,19 +147,18 @@ def calibrate_frame(frame: np.ndarray, pattern: np.ndarray,
 # --------------------------------------------------------------------------- #
 
 def _cv2_bayer_code(pattern: np.ndarray) -> int:
+    """Map rawpy 2×2 Bayer pattern to cv2 VNG demosaic code (BGR output).
+
+    Always returns a 2BGR code so channel order is unambiguous.
+    COLOR_BayerXX2RGB aliases are numerically equal to COLOR_BayerYY2BGR with
+    the pattern letters swapped, so they silently apply the wrong pattern.
     """
-    Map rawpy 2×2 Bayer pattern to cv2 VNG demosaic code.
-    cv2's BayerXX2RGB codes are named after the pixel one row/col down from
-    rawpy's (0, 0) origin (i.e. pattern[1, 1] / pattern[1, 0], the latter by
-    2×2 periodicity) -- not pattern[0, 0] / pattern[0, 1] directly. Using the
-    top-left pixel instead effectively swaps R and B in the output.
-    """
-    c1 = int(pattern[1, 1])
-    c2 = int(pattern[1, 0])
-    if   c1 == 0:                  return cv2.COLOR_BayerRG2RGB_VNG  # BGGR
-    elif c1 == 2:                  return cv2.COLOR_BayerBG2RGB_VNG  # RGGB
-    elif c1 in (1, 3) and c2 == 0: return cv2.COLOR_BayerGR2RGB_VNG  # GBRG
-    else:                          return cv2.COLOR_BayerGB2RGB_VNG  # GRBG
+    tl = int(pattern[0, 0])
+    tr = int(pattern[0, 1])
+    if   tl == 0:                  return cv2.COLOR_BayerRG2BGR_VNG  # RGGB → BGR
+    elif tl == 2:                  return cv2.COLOR_BayerBG2BGR_VNG  # BGGR → BGR
+    elif tl in (1, 3) and tr == 0: return cv2.COLOR_BayerGR2BGR_VNG  # GRBG → BGR
+    else:                          return cv2.COLOR_BayerGB2BGR_VNG  # GBRG → BGR
 
 
 def demosaic_to_rgb(bayer: np.ndarray, pattern: np.ndarray) -> np.ndarray:
@@ -170,7 +169,8 @@ def demosaic_to_rgb(bayer: np.ndarray, pattern: np.ndarray) -> np.ndarray:
     """
     if _HAS_CV2:
         u16   = (np.clip(bayer, 0, 1) * 65535).astype(np.uint16)
-        rgb16 = cv2.cvtColor(u16, _cv2_bayer_code(pattern))
+        bgr16 = cv2.cvtColor(u16, _cv2_bayer_code(pattern))          # BGR output
+        rgb16 = cv2.cvtColor(bgr16, cv2.COLOR_BGR2RGB)               # → RGB
         rgb   = rgb16.astype(np.float32) / 65535.0
     else:
         channels = {int(pattern[r, c]): bayer[r::2, c::2]

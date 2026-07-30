@@ -198,6 +198,13 @@ def _compute_median_and_trimmed(paths, n_stack, pattern, black, white, loader,
 # Plots                                                                         #
 # --------------------------------------------------------------------------- #
 
+def _save_rgb_frame(bayer: np.ndarray, pattern: np.ndarray, out: Path) -> None:
+    """Demosaic a calibrated Bayer frame and save it as a full-resolution RGB PNG."""
+    rgb = demosaic_to_rgb(bayer, pattern)
+    plt.imsave(str(out), rgb)
+    print(f"Saved {out}")
+
+
 def _plot_aggregated(mean, median, trimmed, pattern, n_stack, out):
     frames = [mean, median, trimmed]
     titles = [
@@ -331,6 +338,12 @@ def analyze_gt_sequence(
                       out_dir / "gt_differences.png")
     _plot_temporal_noise(temporal_std, out_dir / "gt_temporal_noise.png")
     _plot_convergence(convergence,     out_dir / "gt_convergence.png")
+
+    # Full-resolution RGB saves (one file per aggregation method)
+    print("  Saving full-resolution RGB frames …")
+    _save_rgb_frame(full_mean,     pattern, out_dir / "gt_mean_rgb.png")
+    _save_rgb_frame(median_frame,  pattern, out_dir / "gt_median_rgb.png")
+    _save_rgb_frame(trimmed_frame, pattern, out_dir / "gt_trimmed_mean_rgb.png")
 
     print(f"\nDone. Outputs in {out_dir.resolve()}")
 

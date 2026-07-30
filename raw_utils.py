@@ -147,13 +147,19 @@ def calibrate_frame(frame: np.ndarray, pattern: np.ndarray,
 # --------------------------------------------------------------------------- #
 
 def _cv2_bayer_code(pattern: np.ndarray) -> int:
-    """Map rawpy 2×2 Bayer pattern to cv2 VNG demosaic code."""
-    tl = int(pattern[0, 0])
-    tr = int(pattern[0, 1])
-    if   tl == 0:                  return cv2.COLOR_BayerRG2RGB_VNG  # RGGB
-    elif tl == 2:                  return cv2.COLOR_BayerBG2RGB_VNG  # BGGR
-    elif tl in (1, 3) and tr == 0: return cv2.COLOR_BayerGR2RGB_VNG  # GRBG
-    else:                          return cv2.COLOR_BayerGB2RGB_VNG  # GBRG
+    """
+    Map rawpy 2×2 Bayer pattern to cv2 VNG demosaic code.
+    cv2's BayerXX2RGB codes are named after the pixel one row/col down from
+    rawpy's (0, 0) origin (i.e. pattern[1, 1] / pattern[1, 0], the latter by
+    2×2 periodicity) -- not pattern[0, 0] / pattern[0, 1] directly. Using the
+    top-left pixel instead effectively swaps R and B in the output.
+    """
+    c1 = int(pattern[1, 1])
+    c2 = int(pattern[1, 0])
+    if   c1 == 0:                  return cv2.COLOR_BayerRG2RGB_VNG  # BGGR
+    elif c1 == 2:                  return cv2.COLOR_BayerBG2RGB_VNG  # RGGB
+    elif c1 in (1, 3) and c2 == 0: return cv2.COLOR_BayerGR2RGB_VNG  # GBRG
+    else:                          return cv2.COLOR_BayerGB2RGB_VNG  # GRBG
 
 
 def demosaic_to_rgb(bayer: np.ndarray, pattern: np.ndarray) -> np.ndarray:

@@ -11,18 +11,22 @@ Outputs (saved to OUTPUT_DIR):
   - gt_temporal_noise.png  : per-pixel temporal std heatmap (noise map)
   - gt_noise_cv.png        : σ/μ — coefficient of variation (relative noise)
   - gt_noise_shot_norm.png : σ/√μ — deviation from shot-noise-limited (1 = pure Poisson)
-  - gt_convergence.png     : std across disjoint N-frame blocks vs N (log-log)
-                             with 1/√N reference — an earlier version of this
-                             plot compared the running mean against the
-                             full-sequence mean, which is biased (the running
-                             mean's frames are a subset of the frames used for
-                             the "ground truth" it's compared against, forcing
-                             the error toward zero as N approaches the total
-                             frame count regardless of actual noise behavior).
-                             This version instead splits the sequence into
-                             independent, non-overlapping N-frame blocks and
-                             measures the spread across their means directly,
-                             which has no such bias.
+  - gt_convergence.png     : std across disjoint N-frame blocks vs N (log-log,
+                             two panels: plain std, and shot-noise-normalized
+                             σ/√μ), each with a 1/√N reference — an earlier
+                             version of this plot compared the running mean
+                             against the full-sequence mean, which is biased
+                             (the running mean's frames are a subset of the
+                             frames used for the "ground truth" it's compared
+                             against, forcing the error toward zero as N
+                             approaches the total frame count regardless of
+                             actual noise behavior). This version instead
+                             splits the sequence into independent,
+                             non-overlapping N-frame blocks and measures the
+                             spread across their means directly, which has no
+                             such bias. The shot-noise-normalized panel
+                             additionally removes the signal-level dependence
+                             that a plain std mixes together across pixels.
 """
 
 import argparse
@@ -165,7 +169,20 @@ def _stream_block_std(paths, pattern, black, white, loader,
     per-block-size accumulators cheap; std should scale ~1/√N if per-frame
     noise behaves independently across frames.
 
-    Returns a list of (N, mean_std_over_roi, n_blocks) tuples, N=1 first.
+    Also reports a shot-noise-normalized curve, mean(std / sqrt(mu)) per N,
+    using the per-pixel mean mu from the N=1 pass as a fixed reference. Plain
+    std mixes together pixels at very different signal levels -- under shot
+    noise, sigma ~ sqrt(mu), so a bright pixel and a dark pixel have genuinely
+    different noise scales, and averaging their raw stds together produces a
+    number that's a scene/ROI-dependent blend, not a value comparable across
+    scenes. Dividing each pixel by sqrt(its own mu) first removes that
+    signal-level dependence (mirrors gt_noise_shot_norm.png's convention:
+    ~1 = pure Poisson) so the reported number means the same thing regardless
+    of what's in the ROI. Both curves still scale as 1/√N in N, since sqrt(N)
+    factors out of the spatial average either way -- normalizing changes the
+    y-axis's meaning, not the shape being tested.
+
+    Returns a list of (N, mean_std, mean_shot_norm, n_blocks) tuples, N=1 first.
     """
     n = len(paths)
     max_n = n // 4
@@ -209,11 +226,15 @@ def _stream_block_std(paths, pattern, black, white, loader,
                 block_count[N] = 0
     print()
 
+    mu_map = wf_mean[1]           # per-pixel signal level, from the N=1 pass
+    mask   = mu_map > 1e-4
+
     results = []
     for N in all_ns:
         if wf_n[N] > 1:
             std_map = np.sqrt(wf_M2[N] / (wf_n[N] - 1))
-            results.append((N, float(std_map.mean()), wf_n[N]))
+            shot_norm_map = np.where(mask, std_map / np.sqrt(np.where(mask, mu_map, 1.0)), np.nan)
+            results.append((N, float(std_map.mean()), float(np.nanmean(shot_norm_map)), wf_n[N]))
     return results
 
 
@@ -370,31 +391,52 @@ def _plot_noise_shot_norm(temporal_std, full_mean, out):
 
 def _plot_block_std_convergence(results, out):
     """
-    results: list of (N, mean_std_over_roi, n_blocks) from _stream_block_std.
-    Reference line is anchored to the N=1 point (plain per-frame std), which
-    is an independent measurement -- not fit through a possibly-lucky sample.
+    results: list of (N, mean_std, mean_shot_norm, n_blocks) from
+    _stream_block_std. Each reference line is anchored to its own N=1 point
+    (an independent measurement, not a fit through a possibly-lucky sample).
+
+    Two panels, same N-dependence, different y-axis meaning:
+      left  - plain std, mean(sigma) over the ROI: mixes pixels at different
+              signal levels, so the absolute number is a scene/ROI-dependent
+              blend, not comparable across scenes.
+      right - shot-noise-normalized, mean(sigma/sqrt(mu)) over the ROI: each
+              pixel divided by its own sqrt(signal) first, so brightness
+              differences across pixels don't distort the blend; ~1 = pure
+              Poisson, comparable across scenes (same convention as
+              gt_noise_shot_norm.png).
+    Both should still trace ~1/√N -- normalizing changes what the y-axis
+    means, not the N-scaling being tested (sqrt(N) factors out of the
+    spatial average the same way in either case).
     """
     if not results:
         print(f"  Skipping {out.name}: no block-std results")
         return
-    ns  = np.array([r[0] for r in results], dtype=float)
-    std = np.array([r[1] for r in results], dtype=float)
-    n_blocks = [r[2] for r in results]
+    ns        = np.array([r[0] for r in results], dtype=float)
+    std       = np.array([r[1] for r in results], dtype=float)
+    shot_norm = np.array([r[2] for r in results], dtype=float)
+    n_blocks  = [r[3] for r in results]
 
-    fig, ax = plt.subplots(figsize=(8, 5))
-    ax.loglog(ns, std, "o-", color="steelblue", linewidth=1.8, markersize=5,
-              label="measured std (across disjoint N-frame blocks)")
-    ref = std[0] / np.sqrt(ns)
-    ax.loglog(ns, ref, "--", color="tomato", linewidth=1.4,
-              label=r"$\propto 1/\sqrt{N}$ (anchored to N=1)")
-    for x, y, m in zip(ns, std, n_blocks):
-        ax.annotate(f"{m} blocks", (x, y), textcoords="offset points",
-                    xytext=(4, 4), fontsize=7, color="gray")
-    ax.set_xlabel("Frames averaged per block  (N)", fontsize=11)
-    ax.set_ylabel("Std across independent block means  [calibrated]", fontsize=11)
-    ax.set_title("Noise vs. frames averaged (disjoint blocks, unbiased)", fontsize=13)
-    ax.legend(fontsize=10)
-    ax.grid(True, which="both", alpha=0.3, linestyle="--")
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    panels = [
+        (axes[0], std,       "Std across independent block means  [calibrated]",
+         "Noise vs. N (disjoint blocks)"),
+        (axes[1], shot_norm, r"Shot-noise-normalized  mean(σ/√μ)  (1 = pure Poisson)",
+         "Shot-noise-normalized noise vs. N"),
+    ]
+    for ax, y, ylabel, title in panels:
+        ax.loglog(ns, y, "o-", color="steelblue", linewidth=1.8, markersize=5,
+                  label="measured (across disjoint N-frame blocks)")
+        ref = y[0] / np.sqrt(ns)
+        ax.loglog(ns, ref, "--", color="tomato", linewidth=1.4,
+                  label=r"$\propto 1/\sqrt{N}$ (anchored to N=1)")
+        for x, yy, m in zip(ns, y, n_blocks):
+            ax.annotate(f"{m} blocks", (x, yy), textcoords="offset points",
+                        xytext=(4, 4), fontsize=7, color="gray")
+        ax.set_xlabel("Frames averaged per block  (N)", fontsize=11)
+        ax.set_ylabel(ylabel, fontsize=10)
+        ax.set_title(title, fontsize=12)
+        ax.legend(fontsize=9)
+        ax.grid(True, which="both", alpha=0.3, linestyle="--")
     fig.tight_layout()
     fig.savefig(out, dpi=150)
     plt.close(fig)

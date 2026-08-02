@@ -147,18 +147,20 @@ def calibrate_frame(frame: np.ndarray, pattern: np.ndarray,
 # --------------------------------------------------------------------------- #
 
 def _cv2_bayer_code(pattern: np.ndarray) -> int:
-    """Map rawpy 2×2 Bayer pattern to cv2 VNG demosaic code (BGR output).
-
-    Always returns a 2BGR code so channel order is unambiguous.
-    COLOR_BayerXX2RGB aliases are numerically equal to COLOR_BayerYY2BGR with
-    the pattern letters swapped, so they silently apply the wrong pattern.
     """
-    tl = int(pattern[0, 0])
-    tr = int(pattern[0, 1])
-    if   tl == 0:                  return cv2.COLOR_BayerRG2BGR_VNG  # RGGB → BGR
-    elif tl == 2:                  return cv2.COLOR_BayerBG2BGR_VNG  # BGGR → BGR
-    elif tl in (1, 3) and tr == 0: return cv2.COLOR_BayerGR2BGR_VNG  # GRBG → BGR
-    else:                          return cv2.COLOR_BayerGB2BGR_VNG  # GBRG → BGR
+    Map rawpy 2×2 Bayer pattern to cv2 VNG demosaic code.
+    cv2's BayerXX2RGB codes are named after the pixel one row/col down from
+    rawpy's (0, 0) origin (i.e. pattern[1, 1] / pattern[1, 0], the latter by
+    2×2 periodicity) -- not pattern[0, 0] / pattern[0, 1] directly. Using the
+    top-left pixel instead effectively swaps R and B in the output. Verified
+    empirically against known ground-truth colors for all four pattern types.
+    """
+    c1 = int(pattern[1, 1])
+    c2 = int(pattern[1, 0])
+    if   c1 == 0:                  return cv2.COLOR_BayerRG2RGB_VNG  # BGGR
+    elif c1 == 2:                  return cv2.COLOR_BayerBG2RGB_VNG  # RGGB
+    elif c1 in (1, 3) and c2 == 0: return cv2.COLOR_BayerGR2RGB_VNG  # GBRG
+    else:                          return cv2.COLOR_BayerGB2RGB_VNG  # GRBG
 
 
 def demosaic_to_rgb(bayer: np.ndarray, pattern: np.ndarray) -> np.ndarray:
@@ -168,10 +170,14 @@ def demosaic_to_rgb(bayer: np.ndarray, pattern: np.ndarray) -> np.ndarray:
     Returns float32 H×W×3 in [0, 1], percentile-stretched per channel for display.
     """
     if _HAS_CV2:
-        u16   = (np.clip(bayer, 0, 1) * 65535).astype(np.uint16)
-        bgr16 = cv2.cvtColor(u16, _cv2_bayer_code(pattern))          # BGR output
-        rgb16 = cv2.cvtColor(bgr16, cv2.COLOR_BGR2RGB)               # → RGB
-        rgb   = rgb16.astype(np.float32) / 65535.0
+        # cv2's VNG demosaicing only supports 8-bit input (it asserts
+        # depth == CV_8U); feeding it a 16-bit buffer either crashes or
+        # (on builds without the assertion) silently misreads the buffer
+        # stride, corrupting the reconstruction with a heavy green skew
+        # since green sites are half the Bayer mosaic.
+        u8   = (np.clip(bayer, 0, 1) * 255).astype(np.uint8)
+        rgb8 = cv2.cvtColor(u8, _cv2_bayer_code(pattern))
+        rgb  = rgb8.astype(np.float32) / 255.0
     else:
         channels = {int(pattern[r, c]): bayer[r::2, c::2]
                     for r in range(2) for c in range(2)}

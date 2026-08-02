@@ -11,7 +11,18 @@ Outputs (saved to OUTPUT_DIR):
   - gt_temporal_noise.png  : per-pixel temporal std heatmap (noise map)
   - gt_noise_cv.png        : σ/μ — coefficient of variation (relative noise)
   - gt_noise_shot_norm.png : σ/√μ — deviation from shot-noise-limited (1 = pure Poisson)
-  - gt_convergence.png     : RMS vs N frames (log-log) with 1/√N reference
+  - gt_convergence.png     : std across disjoint N-frame blocks vs N (log-log)
+                             with 1/√N reference — an earlier version of this
+                             plot compared the running mean against the
+                             full-sequence mean, which is biased (the running
+                             mean's frames are a subset of the frames used for
+                             the "ground truth" it's compared against, forcing
+                             the error toward zero as N approaches the total
+                             frame count regardless of actual noise behavior).
+                             This version instead splits the sequence into
+                             independent, non-overlapping N-frame blocks and
+                             measures the spread across their means directly,
+                             which has no such bias.
 """
 
 import argparse
@@ -43,6 +54,10 @@ MAX_FRAMES    = None  # int to cap total frames loaded, None = all
 MAX_STACK     = 60    # max frames loaded into RAM for median / trimmed-mean
 TRIM_FRAC     = 0.05  # total fraction trimmed (symmetric: TRIM_FRAC/2 from each tail)
 N_SAMPLES     = 5     # number of evenly-spaced sample frames to show
+
+CONV_ROI_FRAC   = 0.25  # central crop (fraction of H and W) used for the block-std
+                        # convergence check -- kept small so per-N accumulators stay cheap
+CONV_N_LEVELS   = 8     # number of log-spaced block sizes N to test (plus N=1)
 # ============================================================
 
 
@@ -94,26 +109,14 @@ def _stream_mean(paths, pattern, black, white, loader):
     return calibrate_frame(mean_adu, pattern, black, white)
 
 
-def _stream_welford_and_convergence(paths, pattern, black, white, loader,
-                                    full_mean, n_checkpoints=40):
+def _stream_welford(paths, pattern, black, white, loader):
     """
-    Pass 2 — Welford online algorithm for temporal std, plus convergence tracking.
-
-    Convergence: RMS of the running mean at log-spaced checkpoints vs the final
-    full-sequence mean.  Follows ~1/√N for independent frames.
-
-    Returns:
-      temporal_std : (H, W) float32  per-pixel noise standard deviation
-      convergence  : list of (n_frames, rms) tuples
+    Pass 2 — Welford online algorithm for per-pixel temporal std.
+    Returns temporal_std : (H, W) float32  per-pixel noise standard deviation.
     """
     n = len(paths)
-    checkpoints = set(np.geomspace(1, n, min(n_checkpoints, n)).astype(int).tolist())
-    checkpoints.add(n)
-
-    wf_mean  = None
-    wf_M2    = None
-    run_sum  = None
-    convergence = []
+    wf_mean = None
+    wf_M2   = None
 
     for i, p in enumerate(paths):
         idx = i + 1
@@ -129,17 +132,89 @@ def _stream_welford_and_convergence(paths, pattern, black, white, loader,
             wf_mean += delta / idx
             wf_M2   += delta * (cal - wf_mean)
 
-        # Convergence: accumulate raw ADU so comparison with full_mean (also from raw ADU)
-        # is not biased by per-frame clipping.
-        run_sum = raw if run_sum is None else run_sum + raw
-        if idx in checkpoints:
-            running = calibrate_frame((run_sum / idx).astype(np.float32), pattern, black, white)
-            rms = float(np.sqrt(np.mean((running - full_mean) ** 2)))
-            convergence.append((idx, rms))
-
     print()
     var = np.where(n > 1, wf_M2 / (n - 1), 0.0).astype(np.float32)
-    return np.sqrt(var), convergence
+    return np.sqrt(var)
+
+
+def _welford_update(wf_mean, wf_M2, wf_n, key, x):
+    wf_n[key] += 1
+    if wf_mean[key] is None:
+        wf_mean[key] = x.copy()
+        wf_M2[key]   = np.zeros_like(x)
+    else:
+        delta = x - wf_mean[key]
+        wf_mean[key] += delta / wf_n[key]
+        wf_M2[key]   += delta * (x - wf_mean[key])
+
+
+def _stream_block_std(paths, pattern, black, white, loader,
+                      roi_frac=0.25, n_levels=8):
+    """
+    Unbiased noise-vs-N-averaged check.
+
+    For several block sizes N (log-spaced, plus N=1), split the sequence into
+    disjoint (non-overlapping) blocks of N consecutive frames, average within
+    each block, then measure the std ACROSS those independent block means.
+    Since blocks never share frames, this has no self-referencing bias --
+    unlike comparing a running mean against a "ground truth" that contains
+    the same frames (which forces the error toward zero as N approaches the
+    total frame count, regardless of actual noise behavior).
+
+    Computed over a central ROI crop (not the full frame) to keep the
+    per-block-size accumulators cheap; std should scale ~1/√N if per-frame
+    noise behaves independently across frames.
+
+    Returns a list of (N, mean_std_over_roi, n_blocks) tuples, N=1 first.
+    """
+    n = len(paths)
+    max_n = n // 4
+    if max_n < 2:
+        print(f"  Skipping block-std convergence: need >= 8 frames, have {n}")
+        return []
+
+    candidate_ns = sorted(set(np.geomspace(2, max_n, n_levels).astype(int).tolist()))
+    all_ns = [1] + candidate_ns
+
+    # Central ROI, cropped at even offsets so the Bayer phase (which absolute
+    # position is R/G/B) matches what calibrate_frame expects.
+    first = loader(paths[0])
+    H, W  = first.shape
+    rh, rw = max(2, int(H * roi_frac)) & ~1, max(2, int(W * roi_frac)) & ~1
+    r0, c0 = ((H - rh) // 2) & ~1, ((W - rw) // 2) & ~1
+    def roi(f):
+        return f[r0:r0 + rh, c0:c0 + rw]
+
+    wf_mean     = {N: None for N in all_ns}
+    wf_M2       = {N: None for N in all_ns}
+    wf_n        = {N: 0 for N in all_ns}
+    block_accum = {N: None for N in candidate_ns}
+    block_count = {N: 0 for N in candidate_ns}
+
+    for i, p in enumerate(paths):
+        print(f"  block-std  [{i+1}/{n}] {p.name}", end="\r", flush=True)
+        raw = roi(loader(p)).astype(np.float64)
+        cal = calibrate_frame(raw.astype(np.float32), pattern, black, white).astype(np.float64)
+
+        _welford_update(wf_mean, wf_M2, wf_n, 1, cal)
+
+        for N in candidate_ns:
+            block_accum[N] = raw if block_accum[N] is None else block_accum[N] + raw
+            block_count[N] += 1
+            if block_count[N] == N:
+                block_mean_adu = (block_accum[N] / N).astype(np.float32)
+                block_mean_cal = calibrate_frame(block_mean_adu, pattern, black, white).astype(np.float64)
+                _welford_update(wf_mean, wf_M2, wf_n, N, block_mean_cal)
+                block_accum[N] = None
+                block_count[N] = 0
+    print()
+
+    results = []
+    for N in all_ns:
+        if wf_n[N] > 1:
+            std_map = np.sqrt(wf_M2[N] / (wf_n[N] - 1))
+            results.append((N, float(std_map.mean()), wf_n[N]))
+    return results
 
 
 def _compute_median_and_trimmed(paths, n_stack, pattern, black, white, loader,
@@ -293,18 +368,31 @@ def _plot_noise_shot_norm(temporal_std, full_mean, out):
     print(f"Saved {out}")
 
 
-def _plot_convergence(convergence, out):
-    ns  = np.array([c[0] for c in convergence], dtype=float)
-    rms = np.array([c[1] for c in convergence], dtype=float)
+def _plot_block_std_convergence(results, out):
+    """
+    results: list of (N, mean_std_over_roi, n_blocks) from _stream_block_std.
+    Reference line is anchored to the N=1 point (plain per-frame std), which
+    is an independent measurement -- not fit through a possibly-lucky sample.
+    """
+    if not results:
+        print(f"  Skipping {out.name}: no block-std results")
+        return
+    ns  = np.array([r[0] for r in results], dtype=float)
+    std = np.array([r[1] for r in results], dtype=float)
+    n_blocks = [r[2] for r in results]
+
     fig, ax = plt.subplots(figsize=(8, 5))
-    ax.loglog(ns, rms, "o-", color="steelblue", linewidth=1.8,
-              markersize=4, label="measured RMS")
-    ref = rms[0] * np.sqrt(ns[0]) / np.sqrt(ns)
+    ax.loglog(ns, std, "o-", color="steelblue", linewidth=1.8, markersize=5,
+              label="measured std (across disjoint N-frame blocks)")
+    ref = std[0] / np.sqrt(ns)
     ax.loglog(ns, ref, "--", color="tomato", linewidth=1.4,
-              label=r"$\propto 1/\sqrt{N}$")
-    ax.set_xlabel("Number of frames averaged  (N)", fontsize=11)
-    ax.set_ylabel("RMS vs full-sequence mean  [calibrated]", fontsize=11)
-    ax.set_title("Convergence of temporal averaging", fontsize=13)
+              label=r"$\propto 1/\sqrt{N}$ (anchored to N=1)")
+    for x, y, m in zip(ns, std, n_blocks):
+        ax.annotate(f"{m} blocks", (x, y), textcoords="offset points",
+                    xytext=(4, 4), fontsize=7, color="gray")
+    ax.set_xlabel("Frames averaged per block  (N)", fontsize=11)
+    ax.set_ylabel("Std across independent block means  [calibrated]", fontsize=11)
+    ax.set_title("Noise vs. frames averaged (disjoint blocks, unbiased)", fontsize=13)
     ax.legend(fontsize=10)
     ax.grid(True, which="both", alpha=0.3, linestyle="--")
     fig.tight_layout()
@@ -359,12 +447,17 @@ def analyze_gt_sequence(
     full_mean = _stream_mean(paths, pattern, black, white, loader)
     print(f"  Mean range: [{full_mean.min():.4f}, {full_mean.max():.4f}]")
 
-    # Pass 2: Welford temporal std + convergence
-    print(f"  Pass 2 — temporal std + convergence …")
-    temporal_std, convergence = _stream_welford_and_convergence(
-        paths, pattern, black, white, loader, full_mean,
-    )
+    # Pass 2: Welford temporal std
+    print(f"  Pass 2 — temporal std …")
+    temporal_std = _stream_welford(paths, pattern, black, white, loader)
     print(f"  Temporal std  mean={temporal_std.mean():.5f}  max={temporal_std.max():.5f}")
+
+    # Pass 3: block-std convergence (disjoint N-frame blocks, unbiased)
+    print(f"  Pass 3 — block-std convergence …")
+    block_std_results = _stream_block_std(
+        paths, pattern, black, white, loader,
+        roi_frac=CONV_ROI_FRAC, n_levels=CONV_N_LEVELS,
+    )
 
     # Median + trimmed mean (disk-backed, no full-stack RAM alloc)
     n_stack  = min(max_stack, n)
@@ -385,7 +478,7 @@ def analyze_gt_sequence(
     _plot_temporal_noise(temporal_std, out_dir / "gt_temporal_noise.png")
     _plot_noise_cv(temporal_std, full_mean,       out_dir / "gt_noise_cv.png")
     _plot_noise_shot_norm(temporal_std, full_mean, out_dir / "gt_noise_shot_norm.png")
-    _plot_convergence(convergence,                out_dir / "gt_convergence.png")
+    _plot_block_std_convergence(block_std_results, out_dir / "gt_convergence.png")
 
     # Full-resolution RGB saves (one file per aggregation method)
     print("  Saving full-resolution RGB frames …")

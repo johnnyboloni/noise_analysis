@@ -28,7 +28,7 @@ from raw_utils import (
     detect_format, find_dngs, find_raws,
     get_raw_metadata, get_raw_metadata_gn3, get_color_metadata,
     load_raw, load_raw_gn3, load_raw_rgb, load_raw_rgb_gn3,
-    calibrate_frame, demosaic_to_rgb, plot_sample_frames,
+    calibrate_frame, demosaic_to_rgb, plot_sample_frames, save_rgb_png,
 )
 
 
@@ -204,8 +204,7 @@ def _save_rgb_frame(bayer: np.ndarray, pattern: np.ndarray, out: Path,
                     wb: np.ndarray | None = None, ccm: np.ndarray | None = None) -> None:
     """Demosaic a calibrated Bayer frame and save it as a full-resolution RGB PNG."""
     rgb = demosaic_to_rgb(bayer, pattern, wb, ccm)
-    plt.imsave(str(out), rgb)
-    print(f"Saved {out}")
+    save_rgb_png(rgb, out)
 
 
 def _plot_aggregated(mean, median, trimmed, pattern, n_stack, out,
@@ -342,11 +341,18 @@ def analyze_gt_sequence(
 
     # Sample frames
     sample_idx = np.linspace(0, n - 1, min(N_SAMPLES, n), dtype=int)
+    sample_frames = [sample_fn(paths[i]) for i in sample_idx]
     plot_sample_frames(
-        [sample_fn(paths[i]) for i in sample_idx],
+        sample_frames,
         [f"frame {i}" for i in sample_idx],
         out_dir / "gt_sample_frames.png",
     )
+    # Individual full-resolution PNGs (no matplotlib tiling/downsampling) so
+    # sample frames can be pixel-inspected directly, e.g. to check whether an
+    # apparent grid/moire artifact is real or an artifact of the composite
+    # plot above being resampled to fit multiple panels in one figure.
+    for i, frame in zip(sample_idx, sample_frames):
+        save_rgb_png(frame, out_dir / f"gt_sample_frame_{i:04d}_full.png")
 
     # Pass 1: full streaming mean
     print(f"  Pass 1 — streaming mean ({n} frames) …")

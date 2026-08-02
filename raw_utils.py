@@ -240,6 +240,22 @@ def demosaic_to_rgb(bayer: np.ndarray, pattern: np.ndarray,
     return rgb ** (1.0 / 2.2)
 
 
+def save_rgb_png(rgb: np.ndarray, out: Path) -> None:
+    """
+    Save an H×W×3 RGB array (float32 in [0, 1], or uint8) as a PNG at exact
+    native resolution, with no resampling -- unlike plot_sample_frames, which
+    tiles multiple frames into one matplotlib figure at a fixed dpi and
+    shrinks each panel well below native resolution, which can alias a
+    demosaiced image into visible grid/moire artifacts that aren't in the
+    real data.
+    """
+    from PIL import Image
+    if rgb.dtype != np.uint8:
+        rgb = (np.clip(rgb, 0, 1) * 255).astype(np.uint8)
+    Image.fromarray(rgb).save(str(out))
+    print(f"Saved {out}")
+
+
 # --------------------------------------------------------------------------- #
 # Shared plot helper                                                             #
 # --------------------------------------------------------------------------- #

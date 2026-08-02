@@ -407,6 +407,13 @@ def _plot_block_std_convergence(results, out):
     Both should still trace ~1/√N -- normalizing changes what the y-axis
     means, not the N-scaling being tested (sqrt(N) factors out of the
     spatial average the same way in either case).
+
+    Each point gets an error bar from the standard error of a sample std
+    estimated from M samples (M = n_blocks at that N): relative SE ≈
+    1/√(2(M−1)). Fewer blocks (large N) means a much noisier estimate of
+    that point -- e.g. M=256 -> ~4%, M=4 -> ~41% -- so the rightmost points
+    are the least trustworthy on the plot, which the error bars make visible
+    directly instead of something to keep in mind separately.
     """
     if not results:
         print(f"  Skipping {out.name}: no block-std results")
@@ -414,7 +421,8 @@ def _plot_block_std_convergence(results, out):
     ns        = np.array([r[0] for r in results], dtype=float)
     std       = np.array([r[1] for r in results], dtype=float)
     shot_norm = np.array([r[2] for r in results], dtype=float)
-    n_blocks  = [r[3] for r in results]
+    n_blocks  = np.array([r[3] for r in results], dtype=float)
+    rel_se    = 1.0 / np.sqrt(2.0 * np.maximum(n_blocks - 1, 1e-9))
 
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
     panels = [
@@ -424,12 +432,16 @@ def _plot_block_std_convergence(results, out):
          "Shot-noise-normalized noise vs. N"),
     ]
     for ax, y, ylabel, title in panels:
-        ax.loglog(ns, y, "o-", color="steelblue", linewidth=1.8, markersize=5,
-                  label="measured (across disjoint N-frame blocks)")
+        ax.errorbar(ns, y, yerr=y * rel_se, fmt="o-", color="steelblue",
+                    linewidth=1.8, markersize=5, capsize=3,
+                    ecolor="steelblue", alpha=0.9,
+                    label="measured ± SE of the std estimate (across disjoint N-frame blocks)")
         ref = y[0] / np.sqrt(ns)
-        ax.loglog(ns, ref, "--", color="tomato", linewidth=1.4,
-                  label=r"$\propto 1/\sqrt{N}$ (anchored to N=1)")
-        for x, yy, m in zip(ns, y, n_blocks):
+        ax.plot(ns, ref, "--", color="tomato", linewidth=1.4,
+               label=r"$\propto 1/\sqrt{N}$ (anchored to N=1)")
+        ax.set_xscale("log")
+        ax.set_yscale("log")
+        for x, yy, m in zip(ns, y, n_blocks.astype(int)):
             ax.annotate(f"{m} blocks", (x, yy), textcoords="offset points",
                         xytext=(4, 4), fontsize=7, color="gray")
         ax.set_xlabel("Frames averaged per block  (N)", fontsize=11)
@@ -437,6 +449,7 @@ def _plot_block_std_convergence(results, out):
         ax.set_title(title, fontsize=12)
         ax.legend(fontsize=9)
         ax.grid(True, which="both", alpha=0.3, linestyle="--")
+    fig.suptitle(f"Block-std convergence check  (N = 1 … {int(ns.max())})", fontsize=13)
     fig.tight_layout()
     fig.savefig(out, dpi=150)
     plt.close(fig)

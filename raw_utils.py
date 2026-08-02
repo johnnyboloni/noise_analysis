@@ -163,38 +163,81 @@ def _cv2_bayer_code(pattern: np.ndarray) -> int:
     else:                          return cv2.COLOR_BayerGB2RGB_VNG  # GRBG
 
 
-def demosaic_to_rgb(bayer: np.ndarray, pattern: np.ndarray) -> np.ndarray:
+def get_color_metadata(path: Path) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Return (white_balance[3], color_matrix[3,3]) from a DNG's embedded camera
+    profile, for color-correcting demosaic_to_rgb output. white_balance is
+    normalized so the green gain is 1. GN3 sequences have no such profile;
+    demosaic_to_rgb falls back to a gray-world WB estimate and no CCM.
+    """
+    with rawpy.imread(str(path)) as raw:
+        wb = np.array(raw.camera_whitebalance[:3], dtype=np.float32)
+        cm = np.array(raw.color_matrix[:3, :3], dtype=np.float32)
+    return wb / wb[1], cm
+
+
+def demosaic_to_rgb(bayer: np.ndarray, pattern: np.ndarray,
+                    wb: np.ndarray | None = None,
+                    ccm: np.ndarray | None = None) -> np.ndarray:
     """
     Full-resolution RGB from a 2D float32 calibrated Bayer array.
-    Uses cv2 VNG demosaicing if available, otherwise half-res channel extraction.
-    Returns float32 H×W×3 in [0, 1], percentile-stretched per channel for display.
+
+    White-balances at the Bayer stage (using `wb`, or a gray-world estimate
+    if not given -- a per-channel *global percentile stretch* was tried
+    previously and is NOT equivalent to white balance: it content-adaptively
+    remaps each channel's own min/max to [0, 1], which crushes channels with
+    a narrower range in any given scene to 0/1 and badly distorts color;
+    verified against rawpy.postprocess() on a synthetic ground-truth DNG,
+    e.g. a neutral gray patch came out as [0, 0, 81] instead of ~[113,109,106]).
+
+    Demosaics with cv2 VNG if available (else half-res channel extraction),
+    optionally applies a camera color-correction matrix (`ccm`, camera RGB ->
+    output RGB, e.g. from get_color_metadata), then gamma-encodes.
+    Returns float32 H×W×3 in [0, 1].
     """
+    if wb is None:
+        means = {}
+        for r in range(2):
+            for c in range(2):
+                ch = int(pattern[r, c])
+                means.setdefault(ch, []).append(float(bayer[r::2, c::2].mean()))
+        means = {ch: np.mean(v) for ch, v in means.items()}
+        g_mean = means[1]
+        wb = np.array([g_mean / max(means[0], 1e-6),
+                        1.0,
+                        g_mean / max(means[2], 1e-6)], dtype=np.float32)
+
+    gain_by_idx = {0: wb[0], 1: wb[1], 2: wb[2], 3: wb[1]}
+    balanced = np.empty_like(bayer)
+    for r in range(2):
+        for c in range(2):
+            ch = int(pattern[r, c])
+            balanced[r::2, c::2] = np.clip(bayer[r::2, c::2] * gain_by_idx[ch], 0, 1)
+
     if _HAS_CV2:
         # cv2's VNG demosaicing only supports 8-bit input (it asserts
         # depth == CV_8U); feeding it a 16-bit buffer either crashes or
         # (on builds without the assertion) silently misreads the buffer
         # stride, corrupting the reconstruction with a heavy green skew
         # since green sites are half the Bayer mosaic.
-        u8   = (np.clip(bayer, 0, 1) * 255).astype(np.uint8)
+        u8   = (balanced * 255).astype(np.uint8)
         rgb8 = cv2.cvtColor(u8, _cv2_bayer_code(pattern))
         rgb  = rgb8.astype(np.float32) / 255.0
     else:
-        channels = {int(pattern[r, c]): bayer[r::2, c::2]
+        channels = {int(pattern[r, c]): balanced[r::2, c::2]
                     for r in range(2) for c in range(2)}
         R = channels[0].astype(np.float32)
         G = ((channels[1] + channels[3]) / 2).astype(np.float32)
         B = channels[2].astype(np.float32)
         rgb = np.stack([R, G, B], axis=-1)
 
-    for i in range(3):
-        lo, hi = np.percentile(rgb[..., i], [0.5, 99.5])
-        rgb[..., i] = np.clip((rgb[..., i] - lo) / max(hi - lo, 1e-6), 0, 1)
+    if ccm is not None:
+        rgb = np.clip(rgb @ ccm.T, 0, 1)
 
     # Sensor data is linear in scene light; sRGB display expects gamma-encoded
     # values, or the image looks dark and flat (rawpy's postprocess applies
     # this internally for the DNG path, but this cv2/manual path never did).
-    rgb = rgb ** (1.0 / 2.2)
-    return rgb
+    return rgb ** (1.0 / 2.2)
 
 
 # --------------------------------------------------------------------------- #

@@ -32,7 +32,7 @@ from raw_utils import (
     _HAS_CV2,
     detect_format as _detect_format,
     find_dngs, find_raws,
-    get_raw_metadata, get_raw_metadata_gn3,
+    get_raw_metadata, get_raw_metadata_gn3, get_color_metadata,
     load_raw, load_raw_gn3, load_raw_rgb, load_raw_rgb_gn3,
     calibrate_frame, demosaic_to_rgb,
     plot_sample_frames,
@@ -622,10 +622,12 @@ def _process_sequence(d: str, label: str, effective_max_frames, cache_dir: Path 
 
     if fmt == 'dng':
         pattern, black, white = get_raw_metadata(paths[0])
+        wb, ccm = get_color_metadata(paths[0])
         loader = load_raw
         sample_rgb = load_raw_rgb(paths[len(paths) // 2])
     else:
         pattern, black, white = _gn3_metadata(paths[0])
+        wb, ccm = None, None
         meta = json.loads(paths[0].with_suffix('.imgprops').read_text())
         shape = (meta['height'], meta['width'])
         loader = lambda p, _s=shape: load_raw_gn3(p, _s)
@@ -697,7 +699,7 @@ def _process_sequence(d: str, label: str, effective_max_frames, cache_dir: Path 
 
     return dict(
         label=label, sample_rgb=sample_rgb,
-        mean=mean, var_frame=var_frame, pattern=pattern,
+        mean=mean, var_frame=var_frame, pattern=pattern, wb=wb, ccm=ccm,
         adu_hist=(adu_counts, adu_edges),
         cal_hist=(cal_counts, cal_edges),
         res_hist=(res_counts, res_edges),
@@ -713,6 +715,8 @@ def _plot_group(results: list[dict], group_label: str, out_dir: Path):
     means       = [r['mean']       for r in results]
     var_frames  = [r['var_frame']  for r in results]
     patterns    = [r['pattern']    for r in results]
+    wbs         = [r['wb']         for r in results]
+    ccms        = [r['ccm']        for r in results]
     adu_hists   = [r['adu_hist']   for r in results]
     cal_hists   = [r['cal_hist']   for r in results]
     res_hists   = [r['res_hist']   for r in results]
@@ -725,7 +729,8 @@ def _plot_group(results: list[dict], group_label: str, out_dir: Path):
 
     plot_sample_frames(sample_rgbs, labels, group_dir / "sample_frames.png")
 
-    mean_rgb = [demosaic_to_rgb(m, p) for m, p in zip(means, patterns)]
+    mean_rgb = [demosaic_to_rgb(m, p, wb, ccm)
+                for m, p, wb, ccm in zip(means, patterns, wbs, ccms)]
     plot_mean_and_variance_frames(mean_rgb, var_frames, labels,
                                   group_dir / "mean_and_variance_frames.png")
 

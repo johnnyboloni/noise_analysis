@@ -26,7 +26,7 @@ import matplotlib.pyplot as plt
 
 from raw_utils import (
     detect_format, find_dngs, find_raws,
-    get_raw_metadata, get_raw_metadata_gn3,
+    get_raw_metadata, get_raw_metadata_gn3, get_color_metadata,
     load_raw, load_raw_gn3, load_raw_rgb, load_raw_rgb_gn3,
     calibrate_frame, demosaic_to_rgb, plot_sample_frames,
 )
@@ -200,14 +200,16 @@ def _compute_median_and_trimmed(paths, n_stack, pattern, black, white, loader,
 # Plots                                                                         #
 # --------------------------------------------------------------------------- #
 
-def _save_rgb_frame(bayer: np.ndarray, pattern: np.ndarray, out: Path) -> None:
+def _save_rgb_frame(bayer: np.ndarray, pattern: np.ndarray, out: Path,
+                    wb: np.ndarray | None = None, ccm: np.ndarray | None = None) -> None:
     """Demosaic a calibrated Bayer frame and save it as a full-resolution RGB PNG."""
-    rgb = demosaic_to_rgb(bayer, pattern)
+    rgb = demosaic_to_rgb(bayer, pattern, wb, ccm)
     plt.imsave(str(out), rgb)
     print(f"Saved {out}")
 
 
-def _plot_aggregated(mean, median, trimmed, pattern, n_stack, out):
+def _plot_aggregated(mean, median, trimmed, pattern, n_stack, out,
+                     wb: np.ndarray | None = None, ccm: np.ndarray | None = None):
     frames = [mean, median, trimmed]
     titles = [
         "Mean (all frames)",
@@ -216,7 +218,7 @@ def _plot_aggregated(mean, median, trimmed, pattern, n_stack, out):
     ]
     fig, axes = plt.subplots(1, 3, figsize=(18, 5))
     for ax, f, t in zip(axes, frames, titles):
-        ax.imshow(demosaic_to_rgb(f, pattern), aspect="auto")
+        ax.imshow(demosaic_to_rgb(f, pattern, wb, ccm), aspect="auto")
         ax.set_title(t, fontsize=10)
         ax.axis("off")
     fig.suptitle("GT aggregation methods", fontsize=13, y=1.01)
@@ -334,6 +336,10 @@ def analyze_gt_sequence(
     n = len(paths)
     print(f"  {n} {fmt.upper()} frames  |  white={white}  black={black[0]}")
 
+    # DNG carries a real camera white-balance + color-correction profile;
+    # GN3 has none, so demosaic_to_rgb falls back to gray-world WB / no CCM.
+    wb, ccm = (get_color_metadata(paths[0]) if fmt == 'dng' else (None, None))
+
     # Sample frames
     sample_idx = np.linspace(0, n - 1, min(N_SAMPLES, n), dtype=int)
     plot_sample_frames(
@@ -367,7 +373,7 @@ def analyze_gt_sequence(
     # Plots
     print("  Plotting …")
     _plot_aggregated(full_mean, median_frame, trimmed_frame, pattern, n_stack,
-                     out_dir / "gt_aggregated.png")
+                     out_dir / "gt_aggregated.png", wb, ccm)
     _plot_differences(full_mean, median_frame, trimmed_frame,
                       out_dir / "gt_differences.png")
     _plot_temporal_noise(temporal_std, out_dir / "gt_temporal_noise.png")
@@ -377,9 +383,9 @@ def analyze_gt_sequence(
 
     # Full-resolution RGB saves (one file per aggregation method)
     print("  Saving full-resolution RGB frames …")
-    _save_rgb_frame(full_mean,     pattern, out_dir / "gt_mean_rgb.png")
-    _save_rgb_frame(median_frame,  pattern, out_dir / "gt_median_rgb.png")
-    _save_rgb_frame(trimmed_frame, pattern, out_dir / "gt_trimmed_mean_rgb.png")
+    _save_rgb_frame(full_mean,     pattern, out_dir / "gt_mean_rgb.png",         wb, ccm)
+    _save_rgb_frame(median_frame,  pattern, out_dir / "gt_median_rgb.png",       wb, ccm)
+    _save_rgb_frame(trimmed_frame, pattern, out_dir / "gt_trimmed_mean_rgb.png", wb, ccm)
 
     print(f"\nDone. Outputs in {out_dir.resolve()}")
 

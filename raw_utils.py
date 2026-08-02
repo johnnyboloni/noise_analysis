@@ -19,6 +19,10 @@ try:
     _HAS_CV2 = True
 except ImportError:
     _HAS_CV2 = False
+    print("WARNING: cv2 not importable -- demosaic_to_rgb() will fall back to "
+          "half-resolution nearest-neighbor channel extraction instead of "
+          "interpolated (VNG) demosaicing. Install opencv-python(-headless) "
+          "for full-resolution, properly interpolated output.", file=sys.stderr)
 
 
 # --------------------------------------------------------------------------- #
@@ -229,10 +233,25 @@ def demosaic_to_rgb(bayer: np.ndarray, pattern: np.ndarray,
         R = channels[0].astype(np.float32)
         G = ((channels[1] + channels[3]) / 2).astype(np.float32)
         B = channels[2].astype(np.float32)
-        rgb = np.stack([R, G, B], axis=-1)
+        half_res = np.stack([R, G, B], axis=-1)
+        # Upsample back to full Bayer resolution (nearest-neighbor) so output
+        # dimensions match the cv2 path regardless of which one ran -- this
+        # branch only samples one position per 2x2 tile, so it's half
+        # resolution in both dimensions before this repeat.
+        rgb = half_res.repeat(2, axis=0).repeat(2, axis=1)[:bayer.shape[0], :bayer.shape[1]]
 
     if ccm is not None:
         rgb = np.clip(rgb @ ccm.T, 0, 1)
+
+    # Auto-brighten to match rawpy.postprocess()'s default (no_auto_bright=
+    # False, used for the per-frame sample previews): without an adaptive
+    # exposure boost, linear sensor data -- especially from a lowlight
+    # sequence -- renders much darker here than in those previews even
+    # though both are otherwise the same WB+CCM+gamma pipeline. Scale so the
+    # 99th-percentile pixel lands near displayable white, leaving headroom.
+    hi = float(np.percentile(rgb, 99))
+    if hi > 1e-6:
+        rgb = np.clip(rgb / hi * 0.92, 0, 1)
 
     # Sensor data is linear in scene light; sRGB display expects gamma-encoded
     # values, or the image looks dark and flat (rawpy's postprocess applies

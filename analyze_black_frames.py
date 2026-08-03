@@ -22,6 +22,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import rawpy
+from tqdm import tqdm
 
 
 # ============================================================
@@ -194,15 +195,13 @@ def stream_dark(paths: list[Path], pattern: np.ndarray,
     adu_counts = np.zeros(n_bins, dtype=np.int64)
     H = W = None
 
-    for i, p in enumerate(paths):
-        print(f"  pass 1  [{i+1}/{len(paths)}] {p.name}", end="\r", flush=True)
+    for p in tqdm(paths, desc="  pass 1 (histogram)", unit="frame", leave=False):
         frame = _load_frame(p)
         h, _ = np.histogram(frame, bins=adu_edges)
         adu_counts += h
         if H is None:
             cal = calibrate_frame(frame, pattern, black, white)
             H, W = cal.shape
-    print()
 
     # Chunk pass — sort once, derive trimmed mean + median.
     # Each chunk: (N × H × chunk_cols) float32, capped at ~512 MB.
@@ -218,7 +217,8 @@ def stream_dark(paths: list[Path], pattern: np.ndarray,
         print(f"  sort chunk [{ci+1}/{n_chunks}] cols {col}–{col_end} …",
               end="\r", flush=True)
         buf = np.empty((T, H, col_end - col), dtype=np.float32)
-        for i, p in enumerate(paths):
+        for i, p in tqdm(enumerate(paths), desc=f"  chunk {ci+1}/{n_chunks}",
+                         total=T, unit="frame", leave=False):
             buf[i] = _load_frame(p)[:, col:col_end]  # raw ADU
         sorted_t = np.sort(buf, axis=0)
         del buf
@@ -237,12 +237,10 @@ def stream_dark(paths: list[Path], pattern: np.ndarray,
     median_cal = calibrate_frame(median_adu, pattern, black, white)
 
     var_accum: np.ndarray | None = None
-    for i, p in enumerate(paths):
-        print(f"  pass 2  [{i+1}/{len(paths)}] {p.name}", end="\r", flush=True)
+    for p in tqdm(paths, desc="  pass 2 (variance)", unit="frame", leave=False):
         cal = calibrate_frame(_load_frame(p), pattern, black, white)
         res = cal.astype(np.float64) - mean_cal
         var_accum = res ** 2 if var_accum is None else var_accum + res ** 2
-    print()
 
     var_cal = (var_accum / len(paths)).astype(np.float32)
     return mean_cal, median_cal, mean_adu, median_adu, var_cal, adu_counts, adu_edges

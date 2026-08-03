@@ -214,10 +214,21 @@ def _find_dngs(directory: str) -> list[Path]:
     return sorted(p.glob("*.dng")) + sorted(p.glob("*.DNG"))
 
 
-def _save_png(rgb: np.ndarray, path: Path) -> None:
-    """Save an (H, W, 3) float32 array as a uint8 PNG using PIL."""
+def _save_png(rgb: np.ndarray, path: Path,
+              lo_pct: float = 0.5, hi_pct: float = 99.5) -> None:
+    """
+    Save an (H, W, 3) float32 array as a uint8 PNG using PIL.
+
+    If the array is already in [0, 1] (calibrated), clips directly.
+    Otherwise applies a percentile stretch (robust against hot pixels).
+    """
     from PIL import Image
-    img = (np.clip(rgb, 0.0, 1.0) * 255).astype(np.uint8)
+    if rgb.max() <= 1.0 and rgb.min() >= 0.0:
+        stretched = rgb
+    else:
+        lo, hi = np.percentile(rgb, [lo_pct, hi_pct])
+        stretched = np.clip((rgb - lo) / max(hi - lo, 1e-6), 0.0, 1.0)
+    img = (stretched * 255).astype(np.uint8)
     Image.fromarray(img).save(path)
 
 
@@ -242,9 +253,6 @@ def cmd_demosaic(args):
         if args.format == "npy":
             np.save(out_dir / f"{p.stem}{suffix}.npy", rgb)
         else:
-            if not args.calibrate:
-                lo, hi = rgb.min(), rgb.max()
-                rgb = (rgb - lo) / max(hi - lo, 1.0)
             _save_png(rgb, out_dir / f"{p.stem}{suffix}.png")
 
     print(f"Saved {len(paths)} frames to {out_dir}/")

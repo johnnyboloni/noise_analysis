@@ -214,6 +214,13 @@ def _find_dngs(directory: str) -> list[Path]:
     return sorted(p.glob("*.dng")) + sorted(p.glob("*.DNG"))
 
 
+def _save_png(rgb: np.ndarray, path: Path) -> None:
+    """Save an (H, W, 3) float32 array as a uint8 PNG using PIL."""
+    from PIL import Image
+    img = (np.clip(rgb, 0.0, 1.0) * 255).astype(np.uint8)
+    Image.fromarray(img).save(path)
+
+
 def cmd_demosaic(args):
     paths = _find_dngs(args.directory)
     if not paths:
@@ -222,16 +229,12 @@ def cmd_demosaic(args):
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
     for p in tqdm(paths, desc="demosaicing", unit="frame"):
         bayer, pattern, black, white = load_bayer(p)
         rgb = demosaic_bilinear(bayer, pattern)
 
         if args.calibrate:
-            rgb = calibrate(rgb, black, white, pattern)
+            rgb    = calibrate(rgb, black, white, pattern)
             suffix = "_cal"
         else:
             suffix = ""
@@ -239,20 +242,10 @@ def cmd_demosaic(args):
         if args.format == "npy":
             np.save(out_dir / f"{p.stem}{suffix}.npy", rgb)
         else:
-            # Save as PNG (clip to [0,1] for display)
             if not args.calibrate:
-                rgb_disp = np.clip(
-                    (rgb - rgb.min()) / max(rgb.ptp(), 1.0), 0.0, 1.0
-                )
-            else:
-                rgb_disp = rgb
-            fig, ax = plt.subplots(figsize=(10, 7))
-            ax.imshow(rgb_disp)
-            ax.axis("off")
-            ax.set_title(p.name, fontsize=9)
-            fig.tight_layout()
-            fig.savefig(out_dir / f"{p.stem}{suffix}.png", dpi=150)
-            plt.close(fig)
+                lo, hi = rgb.min(), rgb.max()
+                rgb = (rgb - lo) / max(hi - lo, 1.0)
+            _save_png(rgb, out_dir / f"{p.stem}{suffix}.png")
 
     print(f"Saved {len(paths)} frames to {out_dir}/")
 
@@ -365,8 +358,8 @@ def main():
     p_dm = sub.add_parser("demosaic", help="Demosaic all DNGs in a directory.")
     p_dm.add_argument("directory", help="Directory containing DNG files.")
     p_dm.add_argument("--out", default="demosaiced", help="Output directory.")
-    p_dm.add_argument("--format", choices=["npy", "png"], default="npy",
-                      help="Output format (default: npy).")
+    p_dm.add_argument("--format", choices=["npy", "png"], default="png",
+                      help="Output format (default: png).")
     p_dm.add_argument("--calibrate", action="store_true",
                       help="Black-subtract and normalise to [0,1].")
 

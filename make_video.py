@@ -122,6 +122,8 @@ def main():
                          "Lower this if the machine becomes unresponsive.")
     ap.add_argument("--no-nice", action="store_true",
                     help="Do not de-prioritise the encoder process.")
+    ap.add_argument("--max-frames", type=int, default=None, metavar="N",
+                    help="Use at most N frames (applied after sorting).")
     ap.add_argument("--reverse", action="store_true",
                     help="Reverse frame order.")
     args = ap.parse_args()
@@ -140,10 +142,16 @@ def main():
     if args.reverse:
         frames.reverse()
 
+    n_found = len(frames)
+    if args.max_frames is not None and args.max_frames < n_found:
+        frames = frames[:args.max_frames]
+
     out = Path(args.out) if args.out else src.parent / f"{src.name}.mp4"
     out.parent.mkdir(parents=True, exist_ok=True)
 
-    print(f"Found {len(frames)} frames: {frames[0].name} … {frames[-1].name}")
+    capped = f" (capped from {n_found})" if len(frames) < n_found else ""
+    print(f"Found {n_found} frames, using {len(frames)}{capped}: "
+          f"{frames[0].name} … {frames[-1].name}")
 
     # Warn before a job large enough to bog the machine down
     try:

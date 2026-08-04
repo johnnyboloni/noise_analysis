@@ -285,6 +285,37 @@ def demosaic_to_rgb(bayer: np.ndarray, pattern: np.ndarray,
     return rgb ** (1.0 / 2.2)
 
 
+def highpass_std(frame: np.ndarray, pattern: np.ndarray, ksize: int = 5) -> float:
+    """
+    Std of the high-pass residual (frame minus a local box mean), averaged over
+    the four Bayer sub-planes.
+
+    Isolates pixel-to-pixel noise from scene content: real scene structure is
+    mostly low-frequency and is removed by the subtraction, while noise is
+    broadband and survives. A plain std over the whole frame would instead be
+    dominated by the scene's own contrast and stay ~flat no matter how many
+    frames were averaged.
+
+    Filtering happens per Bayer sub-plane, never across the raw mosaic --
+    neighbouring mosaic pixels are different colour channels, so a box filter
+    applied directly to the mosaic would read the R/G/B offsets as huge
+    "high-frequency" content that has nothing to do with noise.
+    """
+    resid_stds = []
+    for r in range(2):
+        for c in range(2):
+            plane = np.ascontiguousarray(frame[r::2, c::2], dtype=np.float32)
+            if _HAS_CV2:
+                smooth = cv2.blur(plane, (ksize, ksize))
+                resid_stds.append(float((plane - smooth).std()))
+            else:
+                from numpy.lib.stride_tricks import sliding_window_view
+                pad = ksize // 2
+                smooth = sliding_window_view(plane, (ksize, ksize)).mean(axis=(-1, -2))
+                resid_stds.append(float((plane[pad:-pad, pad:-pad] - smooth).std()))
+    return float(np.mean(resid_stds))
+
+
 def save_rgb_png(rgb: np.ndarray, out: Path) -> None:
     """
     Save an H×W×3 RGB array (float32 in [0, 1], or uint8) as a PNG at exact

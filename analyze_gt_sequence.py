@@ -44,6 +44,7 @@ from raw_utils import (
     get_raw_metadata, get_raw_metadata_gn3, get_color_metadata,
     load_raw, load_raw_gn3, load_raw_rgb, load_raw_rgb_gn3,
     calibrate_frame, demosaic_to_rgb, plot_sample_frames, save_rgb_png,
+    highpass_std,
 )
 
 
@@ -112,23 +113,80 @@ def _stream_mean(paths, pattern, black, white, loader,
     without a second pass. The callback is expected to consume the frame
     immediately (save it / keep a crop) rather than retain it, so peak memory
     stays at one frame regardless of how many checkpoints are requested.
+
+    Frames are accumulated in two disjoint halves (even- and odd-indexed) rather
+    than one running sum, which costs one extra float64 accumulator but enables
+    the split-half noise estimate below at no extra I/O. The full running sum is
+    just their sum.
+
+    Returns (full_mean, metrics), where metrics is a list of dicts with keys
+    n, temporal (split-half temporal noise) and highpass (residual pixel noise),
+    both in calibrated units -- see _checkpoint_metrics.
     """
     checkpoints = set(checkpoints or ())
-    accum = None
+    acc_e = acc_o = None
+    n_e = n_o = 0
+    metrics = []
     n = len(paths)
+
     for i, p in enumerate(paths):
-        idx   = i + 1
+        idx = i + 1
         print(f"  mean  [{idx}/{n}] {p.name}", end="\r", flush=True)
-        raw   = loader(p).astype(np.float64)
-        accum = raw if accum is None else accum + raw
-        if idx in checkpoints and on_checkpoint is not None:
-            running = calibrate_frame((accum / idx).astype(np.float32),
+        raw = loader(p).astype(np.float64)
+        if i % 2 == 0:
+            acc_e = raw if acc_e is None else acc_e + raw
+            n_e += 1
+        else:
+            acc_o = raw if acc_o is None else acc_o + raw
+            n_o += 1
+
+        if idx in checkpoints:
+            total   = acc_e if acc_o is None else acc_e + acc_o
+            running = calibrate_frame((total / idx).astype(np.float32),
                                       pattern, black, white)
-            on_checkpoint(idx, running)
+            del total          # free before the split-half diff allocates
+            metrics.append(_checkpoint_metrics(idx, acc_e, acc_o, n_e, n_o,
+                                               running, pattern, white, black))
+            if on_checkpoint is not None:
+                on_checkpoint(idx, running)
             del running
     print()
-    mean_adu = (accum / n).astype(np.float32)
-    return calibrate_frame(mean_adu, pattern, black, white)
+
+    total    = acc_e if acc_o is None else acc_e + acc_o
+    mean_adu = (total / n).astype(np.float32)
+    return calibrate_frame(mean_adu, pattern, black, white), metrics
+
+
+def _checkpoint_metrics(idx, acc_e, acc_o, n_e, n_o, running,
+                        pattern, white, black):
+    """
+    Two complementary noise measures for the running mean at N=idx, both in
+    calibrated units (fraction of full scale) so they are unaffected by the
+    auto-brighten and gamma that the displayed PNGs go through.
+
+    temporal -- split-half estimate. Average the even- and odd-indexed frames
+      separately and subtract: the scene AND any fixed-pattern noise are
+      identical in both halves and cancel exactly, leaving only temporal noise.
+      With var(A-B) = sigma^2 (1/n_e + 1/n_o), the temporal noise of the full
+      N-frame average is std(A-B) * sqrt(n_e*n_o/(n_e+n_o)) / sqrt(N). This is
+      unbiased (the halves share no frames) and should track 1/sqrt(N).
+
+    highpass -- std of the running mean's own high-pass residual. Includes
+      temporal noise AND fixed-pattern noise, which averaging cannot remove.
+      Once this flattens while `temporal` keeps falling, the frame is
+      FPN-limited and more frames will not visibly help.
+    """
+    scale = float(white - black[0])          # ADU -> calibrated units
+    if n_o > 0:
+        diff = (acc_e / n_e) - (acc_o / n_o)
+        temporal = float(diff.std()) * np.sqrt(n_e * n_o / (n_e + n_o)) \
+                   / np.sqrt(n_e + n_o) / scale
+        del diff
+    else:
+        temporal = float('nan')              # N=1: no second half to compare
+    return {'n': idx,
+            'temporal': temporal,
+            'highpass': highpass_std(running, pattern)}
 
 
 def _stream_welford(paths, pattern, black, white, loader):
@@ -319,6 +377,64 @@ def _save_rgb_frame(bayer: np.ndarray, pattern: np.ndarray, out: Path,
     """Demosaic a calibrated Bayer frame and save it as a full-resolution RGB PNG."""
     rgb = demosaic_to_rgb(bayer, pattern, wb, ccm)
     save_rgb_png(rgb, out)
+
+
+def _plot_checkpoint_noise(metrics, out):
+    """
+    Measured noise vs frames averaged, with a 1/sqrt(N) reference.
+
+    Two curves, because they answer different questions: the split-half
+    `temporal` curve says whether averaging is still removing noise, while
+    `highpass` says whether that is still visible in the frame. They diverge
+    once fixed-pattern noise dominates -- which is exactly when more frames
+    stop making a visible difference even though the averaging still works.
+    """
+    ns   = np.array([m['n'] for m in metrics], dtype=float)
+    temp = np.array([m['temporal'] for m in metrics], dtype=float)
+    hp   = np.array([m['highpass'] for m in metrics], dtype=float)
+
+    fig, ax = plt.subplots(figsize=(8.5, 5.5))
+    ok = np.isfinite(temp)
+    ax.loglog(ns[ok], temp[ok], "o-", color="steelblue", linewidth=1.8,
+              markersize=5, label="temporal noise (split-half, unbiased)")
+    ax.loglog(ns, hp, "s-", color="darkorange", linewidth=1.8,
+              markersize=5, label="residual pixel noise (high-pass, incl. FPN)")
+
+    if ok.sum() >= 1:
+        n0, t0 = ns[ok][0], temp[ok][0]
+        ax.loglog(ns, t0 * np.sqrt(n0) / np.sqrt(ns), "--", color="gray",
+                  linewidth=1.3, label=r"ideal $\propto 1/\sqrt{N}$")
+
+    ax.set_xlabel("Frames averaged  (N)", fontsize=11)
+    ax.set_ylabel("Noise  [calibrated units]", fontsize=11)
+    ax.set_title("Does averaging still help?  Measured noise vs N", fontsize=13)
+    ax.legend(fontsize=9)
+    ax.grid(True, which="both", alpha=0.3, linestyle="--")
+    fig.tight_layout()
+    fig.savefig(out, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved {out}")
+
+
+def _print_checkpoint_table(metrics):
+    """Print the per-checkpoint noise numbers, with observed-vs-ideal ratios."""
+    print("\n  Noise vs frames averaged")
+    print(f"  {'N':>6}  {'temporal':>11}  {'vs N=1':>8}  {'ideal':>8}  "
+          f"{'highpass':>11}  {'vs N=1':>8}")
+    print("  " + "-" * 62)
+    base_t = next((m['temporal'] for m in metrics
+                   if np.isfinite(m['temporal'])), None)
+    base_n = next((m['n'] for m in metrics
+                   if np.isfinite(m['temporal'])), None)
+    base_h = metrics[0]['highpass'] if metrics else None
+    for m in metrics:
+        t, h, nn = m['temporal'], m['highpass'], m['n']
+        t_rat = f"{t / base_t:8.3f}" if (base_t and np.isfinite(t)) else f"{'--':>8}"
+        ideal = f"{np.sqrt(base_n / nn):8.3f}" if base_n else f"{'--':>8}"
+        t_str = f"{t:11.6f}" if np.isfinite(t) else f"{'--':>11}"
+        print(f"  {nn:6d}  {t_str}  {t_rat}  {ideal}  "
+              f"{h:11.6f}  {h / base_h:8.3f}")
+    print()
 
 
 def _plot_checkpoint_crops(crops, out, crop_size):
@@ -562,13 +678,16 @@ def analyze_gt_sequence(
 
     print(f"  Pass 1 — streaming mean ({n} frames), "
           f"checkpoints at N={ckpt_ns} …")
-    full_mean = _stream_mean(paths, pattern, black, white, loader,
-                             checkpoints=set(ckpt_ns),
-                             on_checkpoint=_on_checkpoint)
+    full_mean, ckpt_metrics = _stream_mean(
+        paths, pattern, black, white, loader,
+        checkpoints=set(ckpt_ns), on_checkpoint=_on_checkpoint)
     print(f"  Mean range: [{full_mean.min():.4f}, {full_mean.max():.4f}]")
     _plot_checkpoint_crops(ckpt_crops,
                            seq_out / f"gt_running_mean_comparison_N{n}.png",
                            CHECKPOINT_CROP)
+    _print_checkpoint_table(ckpt_metrics)
+    _plot_checkpoint_noise(ckpt_metrics,
+                           seq_out / f"gt_checkpoint_noise_N{n}.png")
 
     # Pass 2: Welford temporal std
     print(f"  Pass 2 — temporal std …")

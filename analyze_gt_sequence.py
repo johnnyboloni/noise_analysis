@@ -62,6 +62,9 @@ N_SAMPLES     = 5     # number of evenly-spaced sample frames to show
 CONV_ROI_FRAC   = 0.25  # central crop (fraction of H and W) used for the block-std
                         # convergence check -- kept small so per-N accumulators stay cheap
 CONV_N_LEVELS   = 8     # number of log-spaced block sizes N to test (plus N=1)
+
+N_CHECKPOINTS   = 5     # running-mean snapshots saved while streaming (log-spaced in N)
+CHECKPOINT_CROP = 400   # centre-crop size (px) for the 100%-zoom checkpoint comparison
 # ============================================================
 
 
@@ -96,18 +99,33 @@ def _make_loaders(directory: str):
 # Streaming passes                                                               #
 # --------------------------------------------------------------------------- #
 
-def _stream_mean(paths, pattern, black, white, loader):
+def _stream_mean(paths, pattern, black, white, loader,
+                 checkpoints=None, on_checkpoint=None):
     """Pass 1 — compute per-pixel calibrated mean, streaming one frame at a time.
 
     Accumulates raw ADU in float64 so sub-black noise cancels across frames,
     then calibrates (and clips) the final mean once.
+
+    If `checkpoints` (a set of 1-based frame counts) and `on_checkpoint` are
+    given, the running mean is calibrated and handed to on_checkpoint(idx, frame)
+    as each count is reached -- letting the caller save intermediate averages
+    without a second pass. The callback is expected to consume the frame
+    immediately (save it / keep a crop) rather than retain it, so peak memory
+    stays at one frame regardless of how many checkpoints are requested.
     """
+    checkpoints = set(checkpoints or ())
     accum = None
     n = len(paths)
     for i, p in enumerate(paths):
-        print(f"  mean  [{i+1}/{n}] {p.name}", end="\r", flush=True)
+        idx   = i + 1
+        print(f"  mean  [{idx}/{n}] {p.name}", end="\r", flush=True)
         raw   = loader(p).astype(np.float64)
         accum = raw if accum is None else accum + raw
+        if idx in checkpoints and on_checkpoint is not None:
+            running = calibrate_frame((accum / idx).astype(np.float32),
+                                      pattern, black, white)
+            on_checkpoint(idx, running)
+            del running
     print()
     mean_adu = (accum / n).astype(np.float32)
     return calibrate_frame(mean_adu, pattern, black, white)
@@ -301,6 +319,32 @@ def _save_rgb_frame(bayer: np.ndarray, pattern: np.ndarray, out: Path,
     """Demosaic a calibrated Bayer frame and save it as a full-resolution RGB PNG."""
     rgb = demosaic_to_rgb(bayer, pattern, wb, ccm)
     save_rgb_png(rgb, out)
+
+
+def _plot_checkpoint_crops(crops, out, crop_size):
+    """
+    Side-by-side 100%-zoom crops of the running mean at increasing N.
+
+    Shown at native pixel scale on purpose: any downscaling averages
+    neighbouring pixels and hides exactly the per-pixel noise this plot exists
+    to show, which would make every panel look equally clean regardless of N.
+    """
+    n_panels = len(crops)
+    fig, axes = plt.subplots(1, n_panels, figsize=(4.2 * n_panels, 4.8))
+    if n_panels == 1:
+        axes = [axes]
+    for ax, (idx, crop) in zip(axes, crops):
+        ax.imshow(crop, interpolation="nearest")
+        ax.set_title(f"N = {idx}", fontsize=11)
+        ax.axis("off")
+    fig.suptitle(
+        f"Running mean vs frames averaged — {crop_size}×{crop_size} centre crop "
+        f"at 100% zoom (noise should fall as 1/√N)",
+        fontsize=12, y=1.02)
+    fig.tight_layout()
+    fig.savefig(out, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved {out}")
 
 
 def _plot_aggregated(mean, median, trimmed, pattern, n_stack, out,
@@ -499,10 +543,32 @@ def analyze_gt_sequence(
     for i, frame in zip(sample_idx, sample_frames):
         save_rgb_png(frame, seq_out / f"gt_sample_frame_{i:04d}_N{n}_full.png")
 
-    # Pass 1: full streaming mean
-    print(f"  Pass 1 — streaming mean ({n} frames) …")
-    full_mean = _stream_mean(paths, pattern, black, white, loader)
+    # Pass 1: full streaming mean, snapshotting the running mean along the way.
+    # Checkpoints are log-spaced because noise falls as 1/sqrt(N) -- linear
+    # spacing would put every panel in the flat tail and show no visible change.
+    ckpt_ns = sorted(set(np.geomspace(1, n, min(N_CHECKPOINTS, n))
+                         .astype(int).tolist()) | {n})
+    ckpt_crops = []
+
+    def _on_checkpoint(idx, running):
+        # Demosaic once and reuse for both the full-res save and the crop --
+        # demosaicing a full-size frame is the expensive part of this callback.
+        rgb = demosaic_to_rgb(running, pattern, wb, ccm)
+        save_rgb_png(rgb, seq_out / f"gt_running_mean_N{idx:05d}.png")
+        cy, cx = rgb.shape[0] // 2, rgb.shape[1] // 2
+        h = min(CHECKPOINT_CROP, rgb.shape[0]) // 2
+        w = min(CHECKPOINT_CROP, rgb.shape[1]) // 2
+        ckpt_crops.append((idx, rgb[cy - h: cy + h, cx - w: cx + w].copy()))
+
+    print(f"  Pass 1 — streaming mean ({n} frames), "
+          f"checkpoints at N={ckpt_ns} …")
+    full_mean = _stream_mean(paths, pattern, black, white, loader,
+                             checkpoints=set(ckpt_ns),
+                             on_checkpoint=_on_checkpoint)
     print(f"  Mean range: [{full_mean.min():.4f}, {full_mean.max():.4f}]")
+    _plot_checkpoint_crops(ckpt_crops,
+                           seq_out / f"gt_running_mean_comparison_N{n}.png",
+                           CHECKPOINT_CROP)
 
     # Pass 2: Welford temporal std
     print(f"  Pass 2 — temporal std …")

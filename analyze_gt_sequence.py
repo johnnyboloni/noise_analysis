@@ -468,9 +468,11 @@ def analyze_gt_sequence(
 ) -> None:
     """
     Analyze a static lowlight sequence for GT frame generation.
-    Saves five plots to out_dir (see module docstring).
+    Saves outputs to out_dir/<sequence_name>/ (see module docstring).
     """
-    out_dir.mkdir(parents=True, exist_ok=True)
+    seq_name = Path(directory).name
+    seq_out  = out_dir / seq_name
+    seq_out.mkdir(parents=True, exist_ok=True)
 
     fmt, paths, pattern, black, white, loader, sample_fn = _make_loaders(directory)
     if max_frames is not None:
@@ -488,14 +490,14 @@ def analyze_gt_sequence(
     plot_sample_frames(
         sample_frames,
         [f"frame {i}" for i in sample_idx],
-        out_dir / "gt_sample_frames.png",
+        seq_out / f"gt_sample_frames_N{n}.png",
     )
     # Individual full-resolution PNGs (no matplotlib tiling/downsampling) so
     # sample frames can be pixel-inspected directly, e.g. to check whether an
     # apparent grid/moire artifact is real or an artifact of the composite
     # plot above being resampled to fit multiple panels in one figure.
     for i, frame in zip(sample_idx, sample_frames):
-        save_rgb_png(frame, out_dir / f"gt_sample_frame_{i:04d}_full.png")
+        save_rgb_png(frame, seq_out / f"gt_sample_frame_{i:04d}_N{n}_full.png")
 
     # Pass 1: full streaming mean
     print(f"  Pass 1 — streaming mean ({n} frames) …")
@@ -516,7 +518,7 @@ def analyze_gt_sequence(
 
     # Median + trimmed mean (disk-backed, no full-stack RAM alloc)
     n_stack  = min(max_stack, n)
-    tmp_path = out_dir / "_stack_tmp.npy"
+    tmp_path = seq_out / "_stack_tmp.npy"
     trim_k   = max(1, int(TRIM_FRAC / 2 * n_stack))
     print(f"  Writing {n_stack}/{n} frames to disk, then computing "
           f"median and trimmed mean (trim_k={trim_k}) …")
@@ -527,21 +529,21 @@ def analyze_gt_sequence(
     # Plots
     print("  Plotting …")
     _plot_aggregated(full_mean, median_frame, trimmed_frame, pattern, n_stack,
-                     out_dir / "gt_aggregated.png", wb, ccm)
+                     seq_out / f"gt_aggregated_N{n}_stack{n_stack}.png", wb, ccm)
     _plot_differences(full_mean, median_frame, trimmed_frame,
-                      out_dir / "gt_differences.png")
-    _plot_temporal_noise(temporal_std, out_dir / "gt_temporal_noise.png")
-    _plot_noise_cv(temporal_std, full_mean,       out_dir / "gt_noise_cv.png")
-    _plot_noise_shot_norm(temporal_std, full_mean, out_dir / "gt_noise_shot_norm.png")
-    _plot_block_std_convergence(block_std_results, out_dir / "gt_convergence.png")
+                      seq_out / f"gt_differences_N{n}_stack{n_stack}.png")
+    _plot_temporal_noise(temporal_std, seq_out / f"gt_temporal_noise_N{n}.png")
+    _plot_noise_cv(temporal_std, full_mean,       seq_out / f"gt_noise_cv_N{n}.png")
+    _plot_noise_shot_norm(temporal_std, full_mean, seq_out / f"gt_noise_shot_norm_N{n}.png")
+    _plot_block_std_convergence(block_std_results, seq_out / f"gt_convergence_N{n}.png")
 
     # Full-resolution RGB saves (one file per aggregation method)
     print("  Saving full-resolution RGB frames …")
-    _save_rgb_frame(full_mean,     pattern, out_dir / "gt_mean_rgb.png",         wb, ccm)
-    _save_rgb_frame(median_frame,  pattern, out_dir / "gt_median_rgb.png",       wb, ccm)
-    _save_rgb_frame(trimmed_frame, pattern, out_dir / "gt_trimmed_mean_rgb.png", wb, ccm)
+    _save_rgb_frame(full_mean,     pattern, seq_out / f"gt_mean_rgb_N{n}.png",              wb, ccm)
+    _save_rgb_frame(median_frame,  pattern, seq_out / f"gt_median_rgb_N{n_stack}.png",      wb, ccm)
+    _save_rgb_frame(trimmed_frame, pattern, seq_out / f"gt_trimmed_mean_rgb_N{n_stack}.png", wb, ccm)
 
-    print(f"\nDone. Outputs in {out_dir.resolve()}")
+    print(f"\nDone. Outputs in {seq_out.resolve()}")
 
 
 # --------------------------------------------------------------------------- #

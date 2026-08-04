@@ -150,21 +150,29 @@ def calibrate_frame(frame: np.ndarray, pattern: np.ndarray,
 # Demosaicing                                                                   #
 # --------------------------------------------------------------------------- #
 
-def _cv2_bayer_code(pattern: np.ndarray) -> int:
+def _cv2_bayer_code(pattern: np.ndarray, suffix: str = '_EA') -> int:
     """
-    Map rawpy 2×2 Bayer pattern to cv2 VNG demosaic code.
+    Map rawpy 2×2 Bayer pattern to a cv2 demosaic code.
+
     cv2's BayerXX2RGB codes are named after the pixel one row/col down from
     rawpy's (0, 0) origin (i.e. pattern[1, 1] / pattern[1, 0], the latter by
     2×2 periodicity) -- not pattern[0, 0] / pattern[0, 1] directly. Using the
     top-left pixel instead effectively swaps R and B in the output. Verified
-    empirically against known ground-truth colors for all four pattern types.
+    empirically against known ground-truth colors for all four pattern types,
+    for '_VNG', '_EA' and '' (bilinear) alike -- the naming convention is the
+    same across variants, so only the suffix changes.
+
+    Default is '_EA' (edge-aware): unlike '_VNG' it accepts 16-bit input, which
+    matters far more here than the choice of interpolation kernel (see
+    demosaic_to_rgb).
     """
     c1 = int(pattern[1, 1])
     c2 = int(pattern[1, 0])
-    if   c1 == 0:                  return cv2.COLOR_BayerRG2RGB_VNG  # BGGR
-    elif c1 == 2:                  return cv2.COLOR_BayerBG2RGB_VNG  # RGGB
-    elif c1 in (1, 3) and c2 == 0: return cv2.COLOR_BayerGR2RGB_VNG  # GBRG
-    else:                          return cv2.COLOR_BayerGB2RGB_VNG  # GRBG
+    if   c1 == 0:                  name = 'COLOR_BayerRG2RGB'  # BGGR
+    elif c1 == 2:                  name = 'COLOR_BayerBG2RGB'  # RGGB
+    elif c1 in (1, 3) and c2 == 0: name = 'COLOR_BayerGR2RGB'  # GBRG
+    else:                          name = 'COLOR_BayerGB2RGB'  # GRBG
+    return getattr(cv2, name + suffix)
 
 
 def get_color_metadata(path: Path) -> tuple[np.ndarray, np.ndarray]:
@@ -219,26 +227,32 @@ def demosaic_to_rgb(bayer: np.ndarray, pattern: np.ndarray,
             balanced[r::2, c::2] = np.clip(bayer[r::2, c::2] * gain_by_idx[ch], 0, 1)
 
     if _HAS_CV2:
-        # cv2's VNG demosaicing only supports 8-bit input (it asserts
-        # depth == CV_8U); feeding it a 16-bit buffer either crashes or
-        # (on builds without the assertion) silently misreads the buffer
-        # stride, corrupting the reconstruction with a heavy green skew
-        # since green sites are half the Bayer mosaic.
+        # Demosaic at 16 bits. The '_VNG' variant is 8-bit only (it asserts
+        # depth == CV_8U), so this uses '_EA' (edge-aware), which accepts
+        # CV_16U and is verified to follow the same pattern-code naming
+        # convention -- see _cv2_bayer_code.
         #
-        # Stretch into the full 0-255 range BEFORE quantizing, then undo the
-        # stretch immediately after. Calibrated lowlight data occupies only the
-        # bottom percent or so of [0, 1], so quantizing it directly leaves the
-        # entire image on a handful of integer levels -- destroying exactly the
-        # sub-LSB precision that averaging hundreds of frames just bought, which
-        # the auto-brighten below then amplifies back up as visible stepping.
+        # Bit depth matters much more than the interpolation kernel here. This
+        # is linear sensor data that gets gamma-encoded on the way out, and
+        # gamma expands the shadows where a lowlight scene lives: one 8-bit
+        # linear LSB (1/255) lands at (1/255)**(1/2.2) ~= 20 display levels
+        # after encoding, so an 8-bit linear buffer bands visibly in exactly
+        # the tones this pipeline cares about. At 16 bits the first LSB is
+        # ~1.6 display levels instead.
+        #
+        # Stretch into the full range BEFORE quantizing, then undo it right
+        # after. Calibrated lowlight data occupies only the bottom percent or
+        # so of [0, 1]; quantizing at that native scale throws away the sub-LSB
+        # precision that averaging hundreds of frames just bought, which the
+        # auto-brighten below then amplifies back up as visible stepping.
         # Undoing the stretch keeps the CCM and auto-brighten operating on
         # linear scene-referred values (the CCM's clip does not commute with a
         # scale factor, so this has to be restored before it, not after).
         pre = float(np.percentile(balanced, 99.9))
         pre = pre if pre > 1e-6 else 1.0
-        u8   = (np.clip(balanced / pre, 0, 1) * 255).astype(np.uint8)
-        rgb8 = cv2.cvtColor(u8, _cv2_bayer_code(pattern))
-        rgb  = rgb8.astype(np.float32) / 255.0 * pre
+        u16   = (np.clip(balanced / pre, 0, 1) * 65535).astype(np.uint16)
+        rgb16 = cv2.cvtColor(u16, _cv2_bayer_code(pattern))
+        rgb   = rgb16.astype(np.float32) / 65535.0 * pre
     else:
         channels = {int(pattern[r, c]): balanced[r::2, c::2]
                     for r in range(2) for c in range(2)}

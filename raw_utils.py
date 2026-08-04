@@ -224,9 +224,21 @@ def demosaic_to_rgb(bayer: np.ndarray, pattern: np.ndarray,
         # (on builds without the assertion) silently misreads the buffer
         # stride, corrupting the reconstruction with a heavy green skew
         # since green sites are half the Bayer mosaic.
-        u8   = (balanced * 255).astype(np.uint8)
+        #
+        # Stretch into the full 0-255 range BEFORE quantizing, then undo the
+        # stretch immediately after. Calibrated lowlight data occupies only the
+        # bottom percent or so of [0, 1], so quantizing it directly leaves the
+        # entire image on a handful of integer levels -- destroying exactly the
+        # sub-LSB precision that averaging hundreds of frames just bought, which
+        # the auto-brighten below then amplifies back up as visible stepping.
+        # Undoing the stretch keeps the CCM and auto-brighten operating on
+        # linear scene-referred values (the CCM's clip does not commute with a
+        # scale factor, so this has to be restored before it, not after).
+        pre = float(np.percentile(balanced, 99.9))
+        pre = pre if pre > 1e-6 else 1.0
+        u8   = (np.clip(balanced / pre, 0, 1) * 255).astype(np.uint8)
         rgb8 = cv2.cvtColor(u8, _cv2_bayer_code(pattern))
-        rgb  = rgb8.astype(np.float32) / 255.0
+        rgb  = rgb8.astype(np.float32) / 255.0 * pre
     else:
         channels = {int(pattern[r, c]): balanced[r::2, c::2]
                     for r in range(2) for c in range(2)}

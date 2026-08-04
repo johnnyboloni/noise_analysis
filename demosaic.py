@@ -64,6 +64,16 @@ def demosaic_adu_frame(frame_adu: np.ndarray, pattern: np.ndarray,
 # Shift detection                                                               #
 # --------------------------------------------------------------------------- #
 
+def _phase_xcorr_map(ref_crop: np.ndarray, tgt_crop: np.ndarray) -> np.ndarray:
+    """Normalized cross-power spectrum → correlation map, shifted so zero-lag is centred."""
+    R = np.fft.rfft2(ref_crop)
+    T = np.fft.rfft2(tgt_crop)
+    G = R * np.conj(T)
+    denom = np.abs(G)
+    G = np.where(denom > 0, G / denom, 0)
+    return np.fft.fftshift(np.fft.irfft2(G))
+
+
 def detect_shifts(paths: list[Path], ref_idx: int = 0,
                   crop_size: int = 512) -> np.ndarray:
     """
@@ -197,11 +207,11 @@ def cmd_detect_shifts(args):
     n_moved = int((mags > args.threshold).sum())
     print(f"\n{n_moved}/{len(paths)} frames exceed {args.threshold}px threshold.")
 
-    if args.plot:
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
 
+    if args.plot:
         fig, (ax_r, ax_c, ax_m) = plt.subplots(3, 1, figsize=(12, 7), sharex=True)
         idx = np.arange(len(paths))
         for ax, vals, ylabel, color in [
@@ -224,6 +234,64 @@ def cmd_detect_shifts(args):
         fig.savefig(args.plot, dpi=150, bbox_inches="tight")
         plt.close(fig)
         print(f"Saved shift plot to {args.plot}")
+
+    if args.sample_crop:
+        # Pick the most-shifted frame (excluding ref) for the comparison panel.
+        mags_masked = mags.copy()
+        mags_masked[args.ref] = -1
+        tgt_idx = int(np.argmax(mags_masked))
+
+        def _crop(path):
+            raw = load_raw(path)
+            cy, cx = raw.shape[0] // 2, raw.shape[1] // 2
+            h = min(args.crop, raw.shape[0]) // 2
+            w = min(args.crop, raw.shape[1]) // 2
+            return raw[cy - h : cy + h, cx - w : cx + w].astype(np.float64)
+
+        ref_crop = _crop(paths[args.ref])
+        tgt_crop = _crop(paths[tgt_idx])
+        xcorr    = _phase_xcorr_map(ref_crop, tgt_crop)
+        sh       = shifts[tgt_idx]
+
+        def _display(arr):
+            lo, hi = np.percentile(arr, [0.5, 99.5])
+            return np.clip((arr - lo) / max(hi - lo, 1e-6), 0, 1)
+
+        fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+
+        axes[0].imshow(_display(ref_crop), cmap="gray", aspect="auto")
+        axes[0].set_title(f"Reference crop  (frame {args.ref})", fontsize=10)
+        axes[0].axis("off")
+
+        axes[1].imshow(_display(tgt_crop), cmap="gray", aspect="auto")
+        axes[1].set_title(
+            f"Most-shifted frame  (frame {tgt_idx})\n"
+            f"shift = ({sh[0]:+.2f} row, {sh[1]:+.2f} col) px", fontsize=10)
+        axes[1].axis("off")
+
+        # Cross-correlation map — zoom into central ±20 px where the peak lives.
+        cy, cx = xcorr.shape[0] // 2, xcorr.shape[1] // 2
+        win = 20
+        zoom = xcorr[cy - win : cy + win + 1, cx - win : cx + win + 1]
+        im = axes[2].imshow(zoom, cmap="inferno", aspect="auto",
+                            extent=[-win, win, win, -win])
+        # Mark the detected peak
+        axes[2].plot(sh[1], sh[0], "w+", markersize=12, markeredgewidth=1.5)
+        axes[2].set_title(
+            f"Normalized cross-correlation  (±{win} px window)\n"
+            f"peak at ({sh[0]:+.2f}, {sh[1]:+.2f})", fontsize=10)
+        axes[2].set_xlabel("col offset (px)")
+        axes[2].set_ylabel("row offset (px)")
+        fig.colorbar(im, ax=axes[2], fraction=0.046, pad=0.04)
+
+        fig.suptitle(
+            f"Phase cross-correlation crop check  "
+            f"(crop {args.crop}×{args.crop} px, upsample×10)",
+            fontsize=12)
+        fig.tight_layout()
+        fig.savefig(args.sample_crop, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        print(f"Saved sample-crop plot to {args.sample_crop}")
 
 
 # --------------------------------------------------------------------------- #
@@ -257,8 +325,11 @@ def main():
                       help="Central crop size in pixels (default: 512).")
     p_sh.add_argument("--threshold", type=float, default=0.5,
                       help="Flag frames shifted more than this (default: 0.5 px).")
-    p_sh.add_argument("--plot",      default=None, metavar="PATH",
+    p_sh.add_argument("--plot",        default=None, metavar="PATH",
                       help="Save a shift-vs-frame-index plot to PATH.")
+    p_sh.add_argument("--sample-crop", default=None, metavar="PATH", dest="sample_crop",
+                      help="Save a 3-panel figure: ref crop | most-shifted crop | "
+                           "cross-correlation map with peak marked.")
 
     args = parser.parse_args()
     {"demosaic":      cmd_demosaic,

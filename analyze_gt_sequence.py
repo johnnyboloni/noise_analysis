@@ -145,11 +145,23 @@ def _stream_mean(paths, pattern, black, white, loader,
             running = calibrate_frame((total / idx).astype(np.float32),
                                       pattern, black, white)
             del total          # free before the split-half diff allocates
-            metrics.append(_checkpoint_metrics(idx, acc_e, acc_o, n_e, n_o,
-                                               running, pattern, white, black))
+
+            # Split-half difference, in calibrated units. The scene and any
+            # fixed-pattern noise are identical in both halves and cancel
+            # exactly, so this is a picture of the temporal noise alone --
+            # the only component averaging can remove. Computed once and
+            # reused for both the metric and the saved image.
+            if n_o > 0:
+                half_diff = ((acc_e / n_e) - (acc_o / n_o)).astype(np.float32)
+                half_diff /= float(white - black[0])
+            else:
+                half_diff = None          # N=1: no second half to compare
+
+            metrics.append(_checkpoint_metrics(idx, half_diff, n_e, n_o,
+                                               running, pattern))
             if on_checkpoint is not None:
-                on_checkpoint(idx, running)
-            del running
+                on_checkpoint(idx, running, half_diff)
+            del running, half_diff
     print()
 
     total    = acc_e if acc_o is None else acc_e + acc_o
@@ -157,8 +169,7 @@ def _stream_mean(paths, pattern, black, white, loader,
     return calibrate_frame(mean_adu, pattern, black, white), metrics
 
 
-def _checkpoint_metrics(idx, acc_e, acc_o, n_e, n_o, running,
-                        pattern, white, black):
+def _checkpoint_metrics(idx, half_diff, n_e, n_o, running, pattern):
     """
     Two complementary noise measures for the running mean at N=idx, both in
     calibrated units (fraction of full scale) so they are unaffected by the
@@ -176,12 +187,9 @@ def _checkpoint_metrics(idx, acc_e, acc_o, n_e, n_o, running,
       Once this flattens while `temporal` keeps falling, the frame is
       FPN-limited and more frames will not visibly help.
     """
-    scale = float(white - black[0])          # ADU -> calibrated units
-    if n_o > 0:
-        diff = (acc_e / n_e) - (acc_o / n_o)
-        temporal = float(diff.std()) * np.sqrt(n_e * n_o / (n_e + n_o)) \
-                   / np.sqrt(n_e + n_o) / scale
-        del diff
+    if half_diff is not None:
+        temporal = float(half_diff.std()) * np.sqrt(n_e * n_o / (n_e + n_o)) \
+                   / np.sqrt(n_e + n_o)
     else:
         temporal = float('nan')              # N=1: no second half to compare
     return {'n': idx,
@@ -377,6 +385,41 @@ def _save_rgb_frame(bayer: np.ndarray, pattern: np.ndarray, out: Path,
     """Demosaic a calibrated Bayer frame and save it as a full-resolution RGB PNG."""
     rgb = demosaic_to_rgb(bayer, pattern, wb, ccm)
     save_rgb_png(rgb, out)
+
+
+def _plot_halfdiff_crops(crops, out, crop_size, vmax):
+    """
+    Split-half difference at each checkpoint: a picture of temporal noise only.
+
+    The scene and any fixed-pattern noise are identical in the two halves and
+    cancel in the subtraction, so unlike the running-mean crops -- which sit on
+    a static floor that averaging cannot touch -- these shrink by the full
+    1/sqrt(N) and the improvement is plainly visible.
+
+    All panels share one colour scale, fixed from the first (noisiest)
+    checkpoint. Per-panel autoscaling would renormalise each image to its own
+    range and hide exactly the shrinkage this plot exists to show.
+    """
+    n_panels = len(crops)
+    fig, axes = plt.subplots(1, n_panels, figsize=(4.2 * n_panels, 5.0))
+    if n_panels == 1:
+        axes = [axes]
+    im = None
+    for ax, (idx, crop, sd) in zip(axes, crops):
+        im = ax.imshow(crop, cmap="RdBu_r", vmin=-vmax, vmax=vmax,
+                       interpolation="nearest")
+        ax.set_title(f"N = {idx}\nstd = {sd:.6f}", fontsize=11)
+        ax.axis("off")
+    if im is not None:
+        fig.colorbar(im, ax=axes, fraction=0.02, pad=0.02,
+                     label="split-half difference [calibrated]")
+    fig.suptitle(
+        f"Temporal noise only — split-half difference, {crop_size}×{crop_size} "
+        f"centre crop, shared colour scale (scene and FPN cancel)",
+        fontsize=12, y=1.02)
+    fig.savefig(out, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved {out}")
 
 
 def _plot_checkpoint_noise(metrics, out):
@@ -664,17 +707,30 @@ def analyze_gt_sequence(
     # spacing would put every panel in the flat tail and show no visible change.
     ckpt_ns = sorted(set(np.geomspace(1, n, min(N_CHECKPOINTS, n))
                          .astype(int).tolist()) | {n})
-    ckpt_crops = []
+    ckpt_crops, half_crops = [], []
+    half_vmax = []            # one-element cell: shared scale, set on first diff
 
-    def _on_checkpoint(idx, running):
+    def _crop_centre(a, size):
+        cy, cx = a.shape[0] // 2, a.shape[1] // 2
+        h = min(size, a.shape[0]) // 2
+        w = min(size, a.shape[1]) // 2
+        return a[cy - h: cy + h, cx - w: cx + w].copy()
+
+    def _on_checkpoint(idx, running, half_diff):
         # Demosaic once and reuse for both the full-res save and the crop --
         # demosaicing a full-size frame is the expensive part of this callback.
         rgb = demosaic_to_rgb(running, pattern, wb, ccm)
         save_rgb_png(rgb, seq_out / f"gt_running_mean_N{idx:05d}.png")
-        cy, cx = rgb.shape[0] // 2, rgb.shape[1] // 2
-        h = min(CHECKPOINT_CROP, rgb.shape[0]) // 2
-        w = min(CHECKPOINT_CROP, rgb.shape[1]) // 2
-        ckpt_crops.append((idx, rgb[cy - h: cy + h, cx - w: cx + w].copy()))
+        ckpt_crops.append((idx, _crop_centre(rgb, CHECKPOINT_CROP)))
+        if half_diff is None:
+            return
+        # Fix the display scale from the first (noisiest) checkpoint and keep
+        # it for all later ones, so the panels stay directly comparable.
+        if not half_vmax:
+            half_vmax.append(max(float(np.percentile(np.abs(half_diff), 99.5)),
+                                 1e-9))
+        half_crops.append((idx, _crop_centre(half_diff, CHECKPOINT_CROP),
+                           float(half_diff.std())))
 
     print(f"  Pass 1 — streaming mean ({n} frames), "
           f"checkpoints at N={ckpt_ns} …")
@@ -685,6 +741,10 @@ def analyze_gt_sequence(
     _plot_checkpoint_crops(ckpt_crops,
                            seq_out / f"gt_running_mean_comparison_N{n}.png",
                            CHECKPOINT_CROP)
+    if half_crops:
+        _plot_halfdiff_crops(half_crops,
+                             seq_out / f"gt_halfdiff_comparison_N{n}.png",
+                             CHECKPOINT_CROP, half_vmax[0])
     _print_checkpoint_table(ckpt_metrics)
     _plot_checkpoint_noise(ckpt_metrics,
                            seq_out / f"gt_checkpoint_noise_N{n}.png")

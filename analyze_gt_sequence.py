@@ -422,6 +422,54 @@ def _plot_halfdiff_crops(crops, out, crop_size, vmax):
     print(f"Saved {out}")
 
 
+def _report_floor(metrics, margins=(3.0, 5.0)):
+    """
+    Derive the static floor and the knee from the checkpoint measurements.
+
+    Model: highpass(N)^2 = sigma1^2 / N + floor^2, where sigma1 is single-frame
+    temporal noise and floor^2 collects everything averaging cannot remove
+    (fixed-pattern noise, plus any fine scene detail the high-pass keeps --
+    the metric cannot separate those two, see plot_highpass_steps.py).
+
+    At N_knee the two terms are equal and highpass sits sqrt(2) above the
+    floor; it is within 10% of the floor at ~4.8*N_knee and 5% at ~9.8*N_knee.
+
+    Note the knee is NOT the point at which averaging stops improving a GT
+    frame. The floor is present in the GT and in the frames it will be compared
+    against, so it cancels out of the GT's error, which stays purely temporal
+    and keeps falling as 1/sqrt(N). The knee marks where the frame stops
+    LOOKING cleaner, not where it stops BEING more accurate.
+    """
+    usable = [m for m in metrics if np.isfinite(m['temporal'])]
+    if not usable:
+        return
+    last     = usable[-1]
+    sigma1   = last['temporal'] * np.sqrt(last['n'])
+    floor_sq = last['highpass'] ** 2 - last['temporal'] ** 2
+
+    print("  Static floor")
+    print(f"    single-frame temporal sigma1 : {sigma1:.6f}")
+    if floor_sq <= 0:
+        print("    static floor                 : not resolvable "
+              "(high-pass is at or below the temporal estimate — still "
+              "temporal-noise limited at this N)")
+        print()
+        return
+    floor = np.sqrt(floor_sq)
+    knee  = (sigma1 / floor) ** 2
+    print(f"    static floor (FPN + detail)  : {floor:.6f}")
+    print(f"    knee N = (sigma1/floor)^2    : {knee:.0f}"
+          f"   (highpass is 1.41x the floor here)")
+    print(f"    N for highpass within 10%    : {4.76 * knee:.0f}")
+    print(f"    frames used                  : {last['n']}"
+          f"   ({'past' if last['n'] >= knee else 'below'} the knee)")
+    print("    temporal noise below floor   : "
+          + ",  ".join(f"{m:.0f}x -> N={m ** 2 * knee:.0f}" for m in margins))
+    print("    (for a GT frame the floor cancels -- size N against your "
+          "denoiser's residual, not against the knee)")
+    print()
+
+
 def _plot_checkpoint_noise(metrics, out):
     """
     Measured noise vs frames averaged, with a 1/sqrt(N) reference.
@@ -478,6 +526,7 @@ def _print_checkpoint_table(metrics):
         print(f"  {nn:6d}  {t_str}  {t_rat}  {ideal}  "
               f"{h:11.6f}  {h / base_h:8.3f}")
     print()
+    _report_floor(metrics)
 
 
 def _plot_checkpoint_crops(crops, out, crop_size):

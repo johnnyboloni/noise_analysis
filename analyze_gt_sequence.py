@@ -8,6 +8,13 @@ Outputs (saved to OUTPUT_DIR):
   - gt_sample_frames.png   : evenly-spaced sample frames (RGB)
   - gt_aggregated.png      : mean / median / trimmed-mean side-by-side (RGB)
   - gt_differences.png     : (mean−median), (mean−trimmed), (median−trimmed) heatmaps
+  - gt_mean_darksub_rgb_*  : mean frame minus a trimmed-mean master dark
+                             (only when DARK_DIR is set)
+  - comparison/            : GT candidates side by side -- mean, dark-subtracted
+                             mean, and gain=1 stills -- as full frames, 100%
+                             crops, and pairwise difference maps, with their
+                             residual pixel noise printed (only when DARK_DIR
+                             and/or STILLS_DIR is set)
   - gt_temporal_noise.png  : per-pixel temporal std heatmap (noise map)
   - gt_noise_cv.png        : σ/μ — coefficient of variation (relative noise)
   - gt_noise_shot_norm.png : σ/√μ — deviation from shot-noise-limited (1 = pure Poisson)
@@ -66,6 +73,16 @@ CONV_N_LEVELS   = 8     # number of log-spaced block sizes N to test (plus N=1)
 
 N_CHECKPOINTS   = 5     # running-mean snapshots saved while streaming (log-spaced in N)
 CHECKPOINT_CROP = 400   # centre-crop size (px) for the 100%-zoom checkpoint comparison
+
+DARK_DIR        = None  # dir of dark frames (lens capped, same gain/exposure).
+                        # Trimmed-mean master dark is subtracted from the mean
+                        # frame. None = skip dark subtraction.
+STILLS_DIR      = None  # dir of gain=1 long-exposure stills to compare against.
+                        # None = skip the comparison.
+MATCH_STILL_INTENSITY = True   # rescale the stills by a robust ratio so the
+                               # comparison is not dominated by an exposure
+                               # mismatch between the two capture settings
+COMPARISON_CROP = 400   # centre-crop size (px) for the 100%-zoom comparison
 # ============================================================
 
 
@@ -166,7 +183,9 @@ def _stream_mean(paths, pattern, black, white, loader,
 
     total    = acc_e if acc_o is None else acc_e + acc_o
     mean_adu = (total / n).astype(np.float32)
-    return calibrate_frame(mean_adu, pattern, black, white), metrics
+    # The raw-ADU mean is returned alongside the calibrated one because dark
+    # subtraction has to happen before black-level removal (see _dark_correct).
+    return calibrate_frame(mean_adu, pattern, black, white), mean_adu, metrics
 
 
 def _checkpoint_metrics(idx, half_diff, n_e, n_o, running, pattern):
@@ -195,6 +214,93 @@ def _checkpoint_metrics(idx, half_diff, n_e, n_o, running, pattern):
     return {'n': idx,
             'temporal': temporal,
             'highpass': highpass_std(running, pattern)}
+
+
+def _dark_master(paths, n_stack, loader, trim_frac, tmp_path):
+    """
+    Trimmed-mean master dark, in raw ADU (never calibrated).
+
+    Calibrating dark frames first would be wrong twice over: calibrate_frame
+    subtracts the black level (which is most of what a dark frame IS) and then
+    clips at zero, destroying the below-black half of the read-noise and DSNU
+    distribution and biasing the master dark upward.
+
+    Trimmed rather than plain mean so that a stray cosmic-ray hit or a dropped
+    frame in the dark sequence does not print itself into every corrected frame.
+    Disk-backed and strip-processed, same as _compute_median_and_trimmed.
+    """
+    n = min(n_stack, len(paths))
+    first = loader(paths[0]).astype(np.float32)
+    H, W  = first.shape
+
+    mm = np.lib.format.open_memmap(str(tmp_path), mode='w+',
+                                   dtype=np.float32, shape=(n, H, W))
+    mm[0] = first
+    del first
+    for i in range(1, n):
+        print(f"  dark [{i+1}/{n}] {paths[i].name}", end="\r", flush=True)
+        mm[i] = loader(paths[i]).astype(np.float32)
+    mm.flush()
+    print()
+
+    trim_k  = max(1, int(trim_frac / 2 * n)) if n >= 4 else 0
+    out     = np.empty((H, W), dtype=np.float32)
+    strip_h = max(1, int(200 * 1024 ** 2 // (n * W * 4)))
+
+    for r0 in range(0, H, strip_h):
+        r1    = min(r0 + strip_h, H)
+        strip = mm[:, r0:r1, :].copy()
+        if trim_k:
+            srt = np.sort(strip, axis=0)
+            out[r0:r1] = srt[trim_k: n - trim_k].mean(axis=0)
+            del srt
+        else:
+            out[r0:r1] = strip.mean(axis=0)
+        del strip
+
+    del mm
+    tmp_path.unlink(missing_ok=True)
+    return out
+
+
+def _dark_master_residual(paths, n_used, loader, black, white):
+    """
+    Estimate the master dark's OWN leftover noise, in calibrated units.
+
+    Subtracting a master dark removes the static dark pattern but adds whatever
+    random noise the master still carries -- so a master built from too few
+    frames injects more noise than the pattern it removes and makes the result
+    worse. This is the number to weigh against that pattern's amplitude.
+
+    Single-frame dark sigma comes from the difference of two frames (the static
+    pattern cancels, leaving sqrt(2) times the per-frame noise); the master's
+    residual is then that divided by sqrt(n_used).
+    """
+    if len(paths) < 2:
+        return None
+    a = loader(paths[0]).astype(np.float64)
+    b = loader(paths[1]).astype(np.float64)
+    sigma1 = float((a - b).std()) / np.sqrt(2.0)
+    return sigma1 / np.sqrt(n_used) / float(white - black[0])
+
+
+def _dark_correct(light_adu, dark_adu, pattern, black, white):
+    """
+    (light - dark) / (white - black), per Bayer channel.
+
+    The black level is present in BOTH terms and cancels in the subtraction, so
+    it must not be subtracted a second time -- which is exactly what feeding the
+    difference through calibrate_frame would do, pushing the whole frame one
+    black level too low. Hence the explicit per-channel scaling here rather than
+    reusing calibrate_frame.
+    """
+    out = np.empty_like(light_adu, dtype=np.float32)
+    for r in range(2):
+        for c in range(2):
+            ch = int(pattern[r, c])
+            out[r::2, c::2] = ((light_adu[r::2, c::2] - dark_adu[r::2, c::2])
+                               / (white - black[ch]))
+    return np.clip(out, 0.0, 1.0)
 
 
 def _stream_welford(paths, pattern, black, white, loader):
@@ -417,6 +523,98 @@ def _plot_halfdiff_crops(crops, out, crop_size, vmax):
         f"Temporal noise only — split-half difference, {crop_size}×{crop_size} "
         f"centre crop, shared colour scale (scene and FPN cancel)",
         fontsize=12, y=1.02)
+    fig.savefig(out, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved {out}")
+
+
+def _stills_reference(directory, shape, match_to=None):
+    """
+    Mean of a directory of stills, calibrated with the stills' OWN metadata.
+
+    These are a separate capture at a different gain and exposure, so their
+    black and white levels need not match the sequence's -- calibrating them
+    with the sequence's values would apply the wrong pedestal and scale.
+
+    If match_to is given, the result is rescaled by the ratio of medians so an
+    exposure mismatch between the two capture settings does not dominate every
+    difference map. The ratio is taken over pixels above a low threshold, since
+    near-black pixels give an unstable ratio.
+    """
+    fmt, paths, pattern, black, white, loader, _ = _make_loaders(directory)
+    accum = None
+    n = len(paths)
+    for i, p in enumerate(paths):
+        print(f"  stills [{i+1}/{n}] {p.name}", end="\r", flush=True)
+        raw   = loader(p).astype(np.float64)
+        accum = raw if accum is None else accum + raw
+    print()
+
+    cal = calibrate_frame((accum / n).astype(np.float32), pattern, black, white)
+    if cal.shape != shape:
+        sys.exit(f"Stills are {cal.shape}, sequence is {shape} -- "
+                 f"cannot compare different resolutions.")
+
+    scale = 1.0
+    if match_to is not None:
+        m = (match_to > 0.01) & (cal > 0.01)
+        if m.sum() > 1000:
+            scale = float(np.median(match_to[m]) / np.median(cal[m]))
+            cal = np.clip(cal * scale, 0.0, 1.0)
+    return cal, n, scale
+
+
+def _plot_comparison(frames, labels, pattern, out, wb=None, ccm=None):
+    """Side-by-side RGB of the GT candidates."""
+    fig, axes = plt.subplots(1, len(frames), figsize=(6.2 * len(frames), 5.4))
+    if len(frames) == 1:
+        axes = [axes]
+    for ax, f, lab in zip(axes, frames, labels):
+        ax.imshow(demosaic_to_rgb(f, pattern, wb, ccm))
+        ax.set_title(lab, fontsize=10)
+        ax.axis("off")
+    fig.suptitle("GT candidates", fontsize=13, y=1.01)
+    fig.tight_layout()
+    fig.savefig(out, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved {out}")
+
+
+def _plot_comparison_crops(frames, labels, pattern, out, crop, wb=None, ccm=None):
+    """100%-zoom centre crops -- downscaling would hide the pixel-level
+    differences these candidates are being compared on."""
+    fig, axes = plt.subplots(1, len(frames), figsize=(4.6 * len(frames), 5.2))
+    if len(frames) == 1:
+        axes = [axes]
+    for ax, f, lab in zip(axes, frames, labels):
+        rgb = demosaic_to_rgb(f, pattern, wb, ccm)
+        cy, cx = rgb.shape[0] // 2, rgb.shape[1] // 2
+        h = min(crop, rgb.shape[0]) // 2
+        w = min(crop, rgb.shape[1]) // 2
+        ax.imshow(rgb[cy - h: cy + h, cx - w: cx + w], interpolation="nearest")
+        ax.set_title(lab, fontsize=10)
+        ax.axis("off")
+    fig.suptitle(f"GT candidates — {crop}×{crop} centre crop at 100% zoom",
+                 fontsize=13, y=1.02)
+    fig.tight_layout()
+    fig.savefig(out, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved {out}")
+
+
+def _plot_comparison_diffs(pairs, out):
+    """Signed difference maps between GT candidates, symmetric colour scales."""
+    fig, axes = plt.subplots(1, len(pairs), figsize=(6.2 * len(pairs), 5.2))
+    if len(pairs) == 1:
+        axes = [axes]
+    for ax, (diff, lab) in zip(axes, pairs):
+        v = max(float(np.percentile(np.abs(diff), 99.5)), 1e-9)
+        im = ax.imshow(diff, cmap="RdBu_r", vmin=-v, vmax=v)
+        ax.set_title(f"{lab}\nstd = {diff.std():.6f}", fontsize=10)
+        ax.axis("off")
+        fig.colorbar(im, ax=ax, fraction=0.035, pad=0.02)
+    fig.suptitle("Differences between GT candidates", fontsize=13, y=1.01)
+    fig.tight_layout()
     fig.savefig(out, dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"Saved {out}")
@@ -783,7 +981,7 @@ def analyze_gt_sequence(
 
     print(f"  Pass 1 — streaming mean ({n} frames), "
           f"checkpoints at N={ckpt_ns} …")
-    full_mean, ckpt_metrics = _stream_mean(
+    full_mean, full_mean_adu, ckpt_metrics = _stream_mean(
         paths, pattern, black, white, loader,
         checkpoints=set(ckpt_ns), on_checkpoint=_on_checkpoint)
     print(f"  Mean range: [{full_mean.min():.4f}, {full_mean.max():.4f}]")
@@ -836,6 +1034,93 @@ def analyze_gt_sequence(
     _save_rgb_frame(full_mean,     pattern, seq_out / f"gt_mean_rgb_N{n}.png",              wb, ccm)
     _save_rgb_frame(median_frame,  pattern, seq_out / f"gt_median_rgb_N{n_stack}.png",      wb, ccm)
     _save_rgb_frame(trimmed_frame, pattern, seq_out / f"gt_trimmed_mean_rgb_N{n_stack}.png", wb, ccm)
+
+    # ---------------------------------------------------------------- #
+    # Dark subtraction                                                   #
+    # ---------------------------------------------------------------- #
+    dark_corrected = None
+    if DARK_DIR:
+        print(f"\n  Dark frames: {DARK_DIR}")
+        _, d_paths, d_pattern, _, _, d_loader, _ = _make_loaders(DARK_DIR)
+        if not np.array_equal(d_pattern, pattern):
+            sys.exit(f"Dark frames have Bayer pattern {d_pattern.tolist()}, "
+                     f"sequence has {pattern.tolist()} -- not the same sensor "
+                     f"layout, refusing to subtract.")
+        d_stack = min(max_stack, len(d_paths))
+        print(f"  Trimmed-mean master dark from {d_stack}/{len(d_paths)} frames …")
+        dark_adu = _dark_master(d_paths, d_stack, d_loader, TRIM_FRAC,
+                                seq_out / "_dark_tmp.npy")
+        if dark_adu.shape != full_mean_adu.shape:
+            sys.exit(f"Dark frames are {dark_adu.shape}, sequence is "
+                     f"{full_mean_adu.shape} -- cannot subtract.")
+        print(f"  Master dark ADU: mean={dark_adu.mean():.2f}  "
+              f"min={dark_adu.min():.2f}  max={dark_adu.max():.2f}  "
+              f"(black level {black[0]:.1f})")
+        dark_corrected = _dark_correct(full_mean_adu, dark_adu, pattern, black, white)
+        _save_rgb_frame(dark_corrected, pattern,
+                        seq_out / f"gt_mean_darksub_rgb_N{n}.png", wb, ccm)
+
+        hp_before = highpass_std(full_mean, pattern)
+        hp_after  = highpass_std(dark_corrected, pattern)
+        resid     = _dark_master_residual(d_paths, d_stack, d_loader, black, white)
+        print(f"  High-pass std   mean={hp_before:.6f}  "
+              f"dark-subtracted={hp_after:.6f}  "
+              f"({(1 - hp_after / hp_before) * 100:+.1f}%)")
+        if resid is not None:
+            print(f"  Master dark's own residual noise: {resid:.6f} "
+                  f"(from {d_stack} frames) — this is added to every "
+                  f"corrected pixel")
+        if hp_after >= hp_before:
+            need = (resid / hp_before) ** 2 * d_stack if resid else None
+            print("  WARNING: dark subtraction made the frame NOISIER. The "
+                  "master dark carries more random noise than the static "
+                  "pattern it removes."
+                  + (f" Roughly {need:.0f}+ dark frames would be needed for it "
+                     f"to break even." if need else ""))
+            print("           Prefer the plain mean, or capture more darks.")
+        elif hp_after > 0.95 * hp_before:
+            print("  NOTE: dark subtraction barely helped (<5%). More dark "
+                  "frames would lower the master's own noise and improve it.")
+
+    # ---------------------------------------------------------------- #
+    # Comparison of GT candidates                                        #
+    # ---------------------------------------------------------------- #
+    cands  = [(full_mean, f"Mean  (N={n})")]
+    if dark_corrected is not None:
+        cands.append((dark_corrected, f"Mean − master dark  (N={n})"))
+    if STILLS_DIR:
+        print(f"\n  Stills: {STILLS_DIR}")
+        still, n_still, scale = _stills_reference(
+            STILLS_DIR, full_mean.shape,
+            match_to=full_mean if MATCH_STILL_INTENSITY else None)
+        print(f"  {n_still} stills averaged"
+              + (f", intensity-matched by ×{scale:.4f}" if MATCH_STILL_INTENSITY
+                 else ", no intensity matching"))
+        cands.append((still, f"Gain=1 stills  (N={n_still})"))
+
+    if len(cands) > 1:
+        cmp_dir = seq_out / "comparison"
+        cmp_dir.mkdir(parents=True, exist_ok=True)
+        print(f"\n  Comparing {len(cands)} GT candidates …")
+
+        frames, labels = [c[0] for c in cands], [c[1] for c in cands]
+        _plot_comparison(frames, labels, pattern,
+                         cmp_dir / "cmp_frames.png", wb, ccm)
+        _plot_comparison_crops(frames, labels, pattern,
+                               cmp_dir / "cmp_crops.png", COMPARISON_CROP, wb, ccm)
+        _plot_comparison_diffs(
+            [(frames[i] - frames[j], f"{labels[i]}  −  {labels[j]}")
+             for i in range(len(frames)) for j in range(i + 1, len(frames))],
+            cmp_dir / "cmp_differences.png")
+        for f, lab in zip(frames, labels):
+            stem = (lab.split('(')[0].strip()
+                       .replace('−', 'minus').replace(' ', '_'))
+            _save_rgb_frame(f, pattern, cmp_dir / f"cmp_{stem}.png", wb, ccm)
+
+        print("\n  Residual pixel noise (high-pass std, calibrated units)")
+        for f, lab in zip(frames, labels):
+            print(f"    {lab:34s} {highpass_std(f, pattern):.6f}")
+        print()
 
     print(f"\nDone. Outputs in {seq_out.resolve()}")
 

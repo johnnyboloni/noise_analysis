@@ -8,8 +8,9 @@ Outputs (saved to OUTPUT_DIR):
   - gt_sample_frames.png   : evenly-spaced sample frames (RGB)
   - gt_aggregated.png      : mean / median / trimmed-mean side-by-side (RGB)
   - gt_differences.png     : (mean−median), (mean−trimmed), (median−trimmed) heatmaps
-  - gt_mean_darksub_rgb_*  : mean frame minus a trimmed-mean master dark
-                             (only when DARK_DIR is set)
+  - gt_mean_darksub_rgb_*  : mean frame minus a sigma-clipped master dark,
+                             with a report of how many dark frames the master
+                             actually wants (only when DARK_DIR is set)
   - comparison/            : GT candidates side by side -- mean, dark-subtracted
                              mean, and gain=1 stills -- as full frames, 100%
                              crops, and pairwise difference maps, with their
@@ -75,8 +76,15 @@ N_CHECKPOINTS   = 5     # running-mean snapshots saved while streaming (log-spac
 CHECKPOINT_CROP = 400   # centre-crop size (px) for the 100%-zoom checkpoint comparison
 
 DARK_DIR        = None  # dir of dark frames (lens capped, same gain/exposure).
-                        # Trimmed-mean master dark is subtracted from the mean
+                        # Sigma-clipped master dark is subtracted from the mean
                         # frame. None = skip dark subtraction.
+DARK_MAX_FRAMES = None  # how many dark frames to average. None = all of them,
+                        # which is normally what you want: the master needs far
+                        # more frames than feels necessary, and too few makes
+                        # the correction worse (the run prints the number your
+                        # own data calls for).
+DARK_SIGMA_CLIP = 4.0   # reject dark samples beyond this many sigma from the
+                        # per-pixel mean (cosmic rays, dropped frames)
 STILLS_DIR      = None  # dir of gain=1 long-exposure stills to compare against.
                         # None = skip the comparison.
 MATCH_STILL_INTENSITY = True   # rescale the stills by a robust ratio so the
@@ -216,51 +224,103 @@ def _checkpoint_metrics(idx, half_diff, n_e, n_o, running, pattern):
             'highpass': highpass_std(running, pattern)}
 
 
-def _dark_master(paths, n_stack, loader, trim_frac, tmp_path):
+def _dark_master(paths, n_use, loader, sigma_clip=4.0):
     """
-    Trimmed-mean master dark, in raw ADU (never calibrated).
+    Sigma-clipped mean master dark, in raw ADU (never calibrated).
 
     Calibrating dark frames first would be wrong twice over: calibrate_frame
     subtracts the black level (which is most of what a dark frame IS) and then
     clips at zero, destroying the below-black half of the read-noise and DSNU
     distribution and biasing the master dark upward.
 
-    Trimmed rather than plain mean so that a stray cosmic-ray hit or a dropped
-    frame in the dark sequence does not print itself into every corrected frame.
-    Disk-backed and strip-processed, same as _compute_median_and_trimmed.
-    """
-    n = min(n_stack, len(paths))
-    first = loader(paths[0]).astype(np.float32)
-    H, W  = first.shape
+    Sigma-clipped rather than trimmed: both reject outliers (a cosmic-ray hit
+    or a dropped frame would otherwise print itself into every corrected frame),
+    but a trimmed mean must sort the whole stack, which needs all N frames
+    resident. At 12 MP that is ~50 MB per frame, so a few hundred darks would
+    need tens of GB of scratch disk. Clipping needs only two streaming passes --
+    Welford for the mean and std, then a mean over pixels within sigma_clip of
+    it -- so memory is flat and the frame count is unbounded, which matters
+    because the master dark wants many more frames than is intuitive
+    (see _dark_advice).
 
-    mm = np.lib.format.open_memmap(str(tmp_path), mode='w+',
-                                   dtype=np.float32, shape=(n, H, W))
-    mm[0] = first
-    del first
-    for i in range(1, n):
-        print(f"  dark [{i+1}/{n}] {paths[i].name}", end="\r", flush=True)
-        mm[i] = loader(paths[i]).astype(np.float32)
-    mm.flush()
+    Returns (master_adu, n_used).
+    """
+    n = min(n_use, len(paths)) if n_use else len(paths)
+
+    mean = M2 = None
+    for i in range(n):
+        print(f"  dark pass1 [{i+1}/{n}] {paths[i].name}", end="\r", flush=True)
+        x = loader(paths[i]).astype(np.float64)
+        if mean is None:
+            mean, M2 = x.copy(), np.zeros_like(x)
+        else:
+            d     = x - mean
+            mean += d / (i + 1)
+            M2   += d * (x - mean)
+    print()
+    std = np.sqrt(M2 / max(n - 1, 1))
+    del M2
+
+    # float32 bounds: these are only thresholds, and mean is recoverable as
+    # their midpoint, so the full-precision mean array can be released here.
+    lo = (mean - sigma_clip * std).astype(np.float32)
+    hi = (mean + sigma_clip * std).astype(np.float32)
+    del std, mean
+
+    s = np.zeros(lo.shape, dtype=np.float64)
+    c = np.zeros(lo.shape, dtype=np.int32)
+    for i in range(n):
+        print(f"  dark pass2 [{i+1}/{n}] {paths[i].name}", end="\r", flush=True)
+        x = loader(paths[i]).astype(np.float32)
+        m = (x >= lo) & (x <= hi)
+        s += np.where(m, x, 0.0)
+        c += m
     print()
 
-    trim_k  = max(1, int(trim_frac / 2 * n)) if n >= 4 else 0
-    out     = np.empty((H, W), dtype=np.float32)
-    strip_h = max(1, int(200 * 1024 ** 2 // (n * W * 4)))
+    out = np.where(c > 0, s / np.maximum(c, 1), (lo + hi) / 2.0).astype(np.float32)
+    rejected = float((n - c.mean()) / n * 100.0)
+    print(f"  sigma-clip (±{sigma_clip}σ) rejected {rejected:.3f}% of samples")
+    return out, n
 
-    for r0 in range(0, H, strip_h):
-        r1    = min(r0 + strip_h, H)
-        strip = mm[:, r0:r1, :].copy()
-        if trim_k:
-            srt = np.sort(strip, axis=0)
-            out[r0:r1] = srt[trim_k: n - trim_k].mean(axis=0)
-            del srt
-        else:
-            out[r0:r1] = strip.mean(axis=0)
-        del strip
 
-    del mm
-    tmp_path.unlink(missing_ok=True)
-    return out
+def _dark_advice(sigma1_cal, master_hp, residual_cal, n_used):
+    """
+    Report how many dark frames the master actually wants.
+
+    The master removes a static pattern of amplitude D but adds its own
+    residual sigma1/sqrt(N_dark). Subtraction only breaks even once that
+    residual drops below D, so:
+
+        N_break_even = (sigma1 / D)^2          residual == D
+        N_recommended = 9 * N_break_even       residual == D/3, a clear win
+
+    D is recovered from the master's own high-pass std, which contains the
+    static pattern and the residual in quadrature: D = sqrt(hp^2 - residual^2).
+    """
+    d_sq = master_hp ** 2 - residual_cal ** 2
+    print(f"    single-frame dark sigma      : {sigma1_cal:.6f}")
+    print(f"    master dark residual         : {residual_cal:.6f} "
+          f"(from {n_used} frames)")
+    if d_sq <= 0:
+        print("    static dark pattern          : not resolvable — the master "
+              "is still dominated by its own noise.")
+        print("    -> far too few dark frames; subtraction will add noise, "
+              "not remove it.")
+        return
+    D = np.sqrt(d_sq)
+    n_break = (sigma1_cal / D) ** 2
+    print(f"    static dark pattern (DSNU)   : {D:.6f}")
+    print(f"    break-even N_dark            : {n_break:.0f}  "
+          f"(residual == pattern; no net gain)")
+    print(f"    recommended N_dark           : {9 * n_break:.0f}  "
+          f"(residual == pattern/3)")
+    print(f"    for residual == pattern/5    : {25 * n_break:.0f}")
+    if n_used < n_break:
+        print("    -> you have too few; the subtraction is making things worse.")
+    elif n_used < 9 * n_break:
+        print("    -> usable, but more darks would still help noticeably.")
+    else:
+        print("    -> comfortably enough.")
 
 
 def _dark_master_residual(paths, n_used, loader, black, white):
@@ -1046,10 +1106,11 @@ def analyze_gt_sequence(
             sys.exit(f"Dark frames have Bayer pattern {d_pattern.tolist()}, "
                      f"sequence has {pattern.tolist()} -- not the same sensor "
                      f"layout, refusing to subtract.")
-        d_stack = min(max_stack, len(d_paths))
-        print(f"  Trimmed-mean master dark from {d_stack}/{len(d_paths)} frames …")
-        dark_adu = _dark_master(d_paths, d_stack, d_loader, TRIM_FRAC,
-                                seq_out / "_dark_tmp.npy")
+        n_dark_want = DARK_MAX_FRAMES or len(d_paths)
+        print(f"  Sigma-clipped master dark from "
+              f"{min(n_dark_want, len(d_paths))}/{len(d_paths)} frames …")
+        dark_adu, d_stack = _dark_master(d_paths, n_dark_want, d_loader,
+                                         DARK_SIGMA_CLIP)
         if dark_adu.shape != full_mean_adu.shape:
             sys.exit(f"Dark frames are {dark_adu.shape}, sequence is "
                      f"{full_mean_adu.shape} -- cannot subtract.")
@@ -1062,25 +1123,21 @@ def analyze_gt_sequence(
 
         hp_before = highpass_std(full_mean, pattern)
         hp_after  = highpass_std(dark_corrected, pattern)
-        resid     = _dark_master_residual(d_paths, d_stack, d_loader, black, white)
         print(f"  High-pass std   mean={hp_before:.6f}  "
               f"dark-subtracted={hp_after:.6f}  "
               f"({(1 - hp_after / hp_before) * 100:+.1f}%)")
+
+        resid = _dark_master_residual(d_paths, d_stack, d_loader, black, white)
         if resid is not None:
-            print(f"  Master dark's own residual noise: {resid:.6f} "
-                  f"(from {d_stack} frames) — this is added to every "
-                  f"corrected pixel")
+            # High-pass of the master needs no black subtraction -- a constant
+            # pedestal has no high-frequency content, so scaling alone puts it
+            # in calibrated units.
+            master_hp = highpass_std(dark_adu / float(white - black[0]), pattern)
+            print("\n  How many dark frames does this master want?")
+            _dark_advice(resid * np.sqrt(d_stack), master_hp, resid, d_stack)
         if hp_after >= hp_before:
-            need = (resid / hp_before) ** 2 * d_stack if resid else None
-            print("  WARNING: dark subtraction made the frame NOISIER. The "
-                  "master dark carries more random noise than the static "
-                  "pattern it removes."
-                  + (f" Roughly {need:.0f}+ dark frames would be needed for it "
-                     f"to break even." if need else ""))
-            print("           Prefer the plain mean, or capture more darks.")
-        elif hp_after > 0.95 * hp_before:
-            print("  NOTE: dark subtraction barely helped (<5%). More dark "
-                  "frames would lower the master's own noise and improve it.")
+            print("  WARNING: dark subtraction made the frame NOISIER — prefer "
+                  "the plain mean, or capture more darks.")
 
     # ---------------------------------------------------------------- #
     # Comparison of GT candidates                                        #

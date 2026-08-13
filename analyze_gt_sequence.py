@@ -16,9 +16,6 @@ Outputs (saved to OUTPUT_DIR):
                              crops, and pairwise difference maps, with their
                              residual pixel noise printed (only when DARK_DIR
                              and/or STILLS_DIR is set)
-  - gt_temporal_noise.png  : per-pixel temporal std heatmap (noise map)
-  - gt_noise_cv.png        : σ/μ — coefficient of variation (relative noise)
-  - gt_noise_shot_norm.png : σ/√μ — deviation from shot-noise-limited (1 = pure Poisson)
   - gt_convergence.png     : std across disjoint N-frame blocks vs N (log-log,
                              two panels: plain std, and shot-noise-normalized
                              σ/√μ), each with a 1/√N reference — an earlier
@@ -412,34 +409,6 @@ def _dark_correct(light_adu, dark_adu, pattern, black, white):
             out[r::2, c::2] = ((light_adu[r::2, c::2] - dark_adu[r::2, c::2])
                                / (white - black[ch]))
     return np.clip(out, 0.0, 1.0)
-
-
-def _stream_welford(paths, pattern, black, white, loader):
-    """
-    Pass 2 — Welford online algorithm for per-pixel temporal std.
-    Returns temporal_std : (H, W) float32  per-pixel noise standard deviation.
-    """
-    n = len(paths)
-    wf_mean = None
-    wf_M2   = None
-
-    for i, p in enumerate(paths):
-        idx = i + 1
-        print(f"  Welford  [{idx}/{n}] {p.name}", end="\r", flush=True)
-        raw = loader(p).astype(np.float64)
-        cal = calibrate_frame(raw.astype(np.float32), pattern, black, white).astype(np.float64)
-
-        if wf_mean is None:
-            wf_mean = cal.copy()
-            wf_M2   = np.zeros_like(cal)
-        else:
-            delta   = cal - wf_mean
-            wf_mean += delta / idx
-            wf_M2   += delta * (cal - wf_mean)
-
-    print()
-    var = np.where(n > 1, wf_M2 / (n - 1), 0.0).astype(np.float32)
-    return np.sqrt(var)
 
 
 def _welford_update(wf_mean, wf_M2, wf_n, key, x):
@@ -905,51 +874,6 @@ def _plot_differences(mean, median, trimmed, out):
     print(f"Saved {out}")
 
 
-def _plot_temporal_noise(temporal_std, out):
-    fig, ax = plt.subplots(figsize=(9, 6))
-    vmax = float(np.percentile(temporal_std, 99))
-    im = ax.imshow(temporal_std, cmap="inferno", vmin=0, vmax=vmax, aspect="auto")
-    ax.set_title("Per-pixel temporal std  (noise map, calibrated units)", fontsize=11)
-    ax.axis("off")
-    fig.colorbar(im, ax=ax, fraction=0.02, pad=0.02, label="σ [calibrated]")
-    fig.tight_layout()
-    fig.savefig(out, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"Saved {out}")
-
-
-def _plot_noise_cv(temporal_std, full_mean, out):
-    """σ/μ — coefficient of variation; removes signal-level dependence."""
-    mask = full_mean > 1e-4
-    cv = np.where(mask, temporal_std / np.where(mask, full_mean, 1.0), np.nan)
-    fig, ax = plt.subplots(figsize=(9, 6))
-    vmax = float(np.nanpercentile(cv, 99))
-    im = ax.imshow(cv, cmap="inferno", vmin=0, vmax=vmax, aspect="auto")
-    ax.set_title("Coefficient of variation  σ/μ  (relative noise per pixel)", fontsize=11)
-    ax.axis("off")
-    fig.colorbar(im, ax=ax, fraction=0.02, pad=0.02, label="σ/μ")
-    fig.tight_layout()
-    fig.savefig(out, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"Saved {out}")
-
-
-def _plot_noise_shot_norm(temporal_std, full_mean, out):
-    """σ/√μ — shot-noise-normalized std; equals ~1 for pure Poisson noise."""
-    mask = full_mean > 1e-4
-    shot_norm = np.where(mask, temporal_std / np.where(mask, np.sqrt(full_mean), 1.0), np.nan)
-    fig, ax = plt.subplots(figsize=(9, 6))
-    vmax = float(np.nanpercentile(shot_norm, 99))
-    im = ax.imshow(shot_norm, cmap="inferno", vmin=0, vmax=vmax, aspect="auto")
-    ax.set_title("Shot-noise-normalized std  σ/√μ  (1 = pure shot noise)", fontsize=11)
-    ax.axis("off")
-    fig.colorbar(im, ax=ax, fraction=0.02, pad=0.02, label="σ/√μ")
-    fig.tight_layout()
-    fig.savefig(out, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"Saved {out}")
-
-
 def _plot_block_std_convergence(results, out):
     """
     results: list of (N, mean_std, mean_shot_norm, n_blocks) from
@@ -1107,13 +1031,8 @@ def analyze_gt_sequence(
     _plot_checkpoint_noise(ckpt_metrics,
                            seq_out / f"gt_checkpoint_noise_N{n}.png")
 
-    # Pass 2: Welford temporal std
-    print(f"  Pass 2 — temporal std …")
-    temporal_std = _stream_welford(paths, pattern, black, white, loader)
-    print(f"  Temporal std  mean={temporal_std.mean():.5f}  max={temporal_std.max():.5f}")
-
-    # Pass 3: block-std convergence (disjoint N-frame blocks, unbiased)
-    print(f"  Pass 3 — block-std convergence …")
+    # Pass 2: block-std convergence (disjoint N-frame blocks, unbiased)
+    print(f"  Pass 2 — block-std convergence …")
     block_std_results = _stream_block_std(
         paths, pattern, black, white, loader,
         roi_frac=CONV_ROI_FRAC, n_levels=CONV_N_LEVELS,
@@ -1135,9 +1054,6 @@ def analyze_gt_sequence(
                      seq_out / f"gt_aggregated_N{n}_stack{n_stack}.png", wb, ccm)
     _plot_differences(full_mean, median_frame, trimmed_frame,
                       seq_out / f"gt_differences_N{n}_stack{n_stack}.png")
-    _plot_temporal_noise(temporal_std, seq_out / f"gt_temporal_noise_N{n}.png")
-    _plot_noise_cv(temporal_std, full_mean,       seq_out / f"gt_noise_cv_N{n}.png")
-    _plot_noise_shot_norm(temporal_std, full_mean, seq_out / f"gt_noise_shot_norm_N{n}.png")
     _plot_block_std_convergence(block_std_results, seq_out / f"gt_convergence_N{n}.png")
 
     # Full-resolution RGB saves (one file per aggregation method)

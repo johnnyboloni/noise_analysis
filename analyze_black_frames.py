@@ -214,8 +214,6 @@ def stream_dark(paths: list[Path], pattern: np.ndarray,
 
     for ci, col in enumerate(range(0, W, chunk_cols)):
         col_end = min(col + chunk_cols, W)
-        print(f"  sort chunk [{ci+1}/{n_chunks}] cols {col}–{col_end} …",
-              end="\r", flush=True)
         buf = np.empty((T, H, col_end - col), dtype=np.float32)
         for i, p in tqdm(enumerate(paths), desc=f"  chunk {ci+1}/{n_chunks}",
                          total=T, unit="frame", leave=False):

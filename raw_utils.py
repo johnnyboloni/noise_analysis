@@ -15,6 +15,34 @@ import rawpy
 import matplotlib.pyplot as plt
 
 try:
+    from tqdm import tqdm as _tqdm
+    _HAS_TQDM = True
+except ImportError:
+    _HAS_TQDM = False
+
+
+def progress(iterable, desc: str = "", total: int | None = None):
+    """
+    Wrap an iterable in a tqdm bar when tqdm is installed, else pass it through.
+
+    Centralised so every script gets the same treatment and none of them hard-
+    depend on tqdm: a missing progress bar should never stop an analysis.
+    """
+    if _HAS_TQDM:
+        return _tqdm(iterable, desc=desc, total=total, unit="frame", leave=False)
+    return iterable
+
+
+def format_duration(seconds: float) -> str:
+    """Human-readable elapsed time, e.g. '1h 04m 12s', '3m 07s', '12.4s'."""
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    m, s = divmod(int(round(seconds)), 60)
+    h, m = divmod(m, 60)
+    return f"{h}h {m:02d}m {s:02d}s" if h else f"{m}m {s:02d}s"
+
+
+try:
     import cv2
     _HAS_CV2 = True
 except ImportError:

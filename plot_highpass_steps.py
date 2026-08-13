@@ -23,6 +23,7 @@ Outputs (saved to OUTPUT_DIR/<sequence_name>/):
 
 import argparse
 import json
+import time
 import sys
 from pathlib import Path
 
@@ -35,7 +36,7 @@ from raw_utils import (
     detect_format, find_dngs, find_raws,
     get_raw_metadata, get_raw_metadata_gn3,
     load_raw, load_raw_gn3, calibrate_frame, demosaic_to_rgb,
-    _HAS_CV2,
+    progress, format_duration, _HAS_CV2,
 )
 
 
@@ -107,9 +108,8 @@ def collect(paths, pattern, black, white, loader, ns, ksizes, plane_idx, crop):
     n_total = len(paths)
     want = set(ns)
 
-    for i, p in enumerate(paths):
+    for i, p in enumerate(progress(paths, desc="  streaming")):
         idx = i + 1
-        print(f"  streaming [{idx}/{n_total}] {p.name}", end="\r", flush=True)
         raw   = loader(p).astype(np.float64)
         accum = raw if accum is None else accum + raw
         if idx not in want:
@@ -317,7 +317,9 @@ def _apply_cli_overrides() -> None:
 def main():
     _apply_cli_overrides()
     print(f"High-pass step visualisation: {SEQUENCE_DIR}")
+    t0 = time.monotonic()
     analyze(SEQUENCE_DIR, Path(OUTPUT_DIR))
+    print(f"Total time: {format_duration(time.monotonic() - t0)}")
 
 
 if __name__ == "__main__":

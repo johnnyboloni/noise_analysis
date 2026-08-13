@@ -25,6 +25,7 @@ import struct
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 
 try:
@@ -35,6 +36,15 @@ except ImportError:                      # decoding often runs on a machine
 
     def tqdm(iterable, **_kwargs):       # passthrough so the loop is unchanged
         return iterable
+
+
+def _format_duration(seconds: float) -> str:
+    """Human-readable elapsed time."""
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    m, sec = divmod(int(round(seconds)), 60)
+    h, m = divmod(m, 60)
+    return f"{h}h {m:02d}m {sec:02d}s" if h else f"{m}m {sec:02d}s"
 
 
 def _write(msg: str) -> None:
@@ -277,6 +287,7 @@ def decode_one(mcraw: Path, out_dir: Path, expected_frames: int | None = None) -
 
 def main() -> None:
     _apply_cli_overrides()
+    t0 = time.monotonic()
 
     input_path  = Path(INPUT_PATH)
     output_root = Path(OUTPUT_ROOT)
@@ -334,7 +345,8 @@ def main() -> None:
 
     print()
     print(f"Done.  {len(mcraw_files) - len(failures)}/{len(mcraw_files)} succeeded"
-          f"  |  {total_dngs} total DNG(s) written")
+          f"  |  {total_dngs} total DNG(s) written"
+          f"  |  {_format_duration(time.monotonic() - t0)}")
 
     if failures:
         print(f"\nFailed files ({len(failures)}):")

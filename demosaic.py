@@ -21,6 +21,7 @@ python demosaic.py detect_shifts /data/dngs --ref 0 --crop 512 --plot shifts.png
 
 import argparse
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -332,9 +333,13 @@ def main():
                            "cross-correlation map with peak marked.")
 
     args = parser.parse_args()
+    t0 = time.monotonic()
     {"demosaic":      cmd_demosaic,
      "compare":       cmd_compare,
      "detect_shifts": cmd_detect_shifts}[args.cmd](args)
+    elapsed = time.monotonic() - t0
+    print(f"Total time: {elapsed:.1f}s" if elapsed < 60
+          else f"Total time: {int(elapsed // 60)}m {int(elapsed % 60):02d}s")
 
 
 if __name__ == "__main__":

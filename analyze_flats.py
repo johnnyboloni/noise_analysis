@@ -29,7 +29,7 @@ import matplotlib.pyplot as plt
 import rawpy
 
 from raw_utils import (
-    _HAS_CV2,
+    _HAS_CV2, progress,
     detect_format as _detect_format,
     find_dngs, find_raws,
     get_raw_metadata, get_raw_metadata_gn3, get_color_metadata,
@@ -172,8 +172,7 @@ def stream_pass1(
     adu_counts = np.zeros(n_bins, dtype=np.int64)
     accum: np.ndarray | None = None
 
-    for i, p in enumerate(paths):
-        print(f"  pass 1  [{i+1}/{len(paths)}] {p.name}", end="\r", flush=True)
+    for i, p in enumerate(progress(paths, desc="  pass 1")):
         raw = loader(p)
         h, _ = np.histogram(raw, bins=adu_edges)
         adu_counts += h
@@ -219,8 +218,7 @@ def stream_pass2(
     frame_shape: tuple | None = None
     residuals_mm: np.ndarray | None = None
 
-    for i, p in enumerate(paths):
-        print(f"  pass 2  [{i+1}/{len(paths)}] {p.name}", end="\r", flush=True)
+    for i, p in enumerate(progress(paths, desc="  pass 2")):
         cal = calibrate_frame(loader(p), pattern, black, white)
 
         h, _ = np.histogram(cal, bins=cal_edges)
@@ -306,8 +304,8 @@ def compute_temporal_autocorr(residuals_mm: np.ndarray, max_lag: int) -> np.ndar
         return np.full(max_lag + 1, np.nan)
 
     acf = np.ones(max_lag + 1)
-    for k in range(1, min(max_lag + 1, N)):
-        print(f"    temporal lag {k}/{min(max_lag, N-1)} …", end="\r", flush=True)
+    for k in progress(range(1, min(max_lag + 1, N)), desc="    temporal lag",
+                      total=min(max_lag, N - 1)):
         cross = 0.0
         n_pairs = N - k
         for t in range(n_pairs):

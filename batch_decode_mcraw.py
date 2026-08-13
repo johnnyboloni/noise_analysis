@@ -19,8 +19,12 @@ All CONFIG constants can also be overridden via CLI flags, e.g.:
 """
 
 import argparse
+import json
+import os
+import struct
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 try:
@@ -49,6 +53,100 @@ OUTPUT_ROOT = "/path/to/output"        # one subdir per capture created here
 DECODER_BIN = "decoder"               # path to motioncam-decoder binary
 NUM_FRAMES  = None                     # int to decode only first N frames; None = all
 # ============================================================
+
+
+# --------------------------------------------------------------------------- #
+# .mcraw container probing                                                      #
+# --------------------------------------------------------------------------- #
+#
+# Layout, from motioncam-decoder's Container.hpp / Decoder.cpp:
+#
+#   offset 0 : Header  { uint8 ident[7] = "MOTION ", uint8 version }
+#              Item    { uint32 type, uint32 size }   type 3 = METADATA
+#              <size bytes of camera-metadata JSON>
+#   ...frames and audio...
+#   EOF - 24 : Item        { uint32 type, uint32 size }   type 0 = BUFFER_INDEX
+#              BufferIndex { uint32 magic, int32 numOffsets, int64 indexDataOffset }
+#
+# numOffsets is the frame count: Decoder::reindexOffsets builds its frame list
+# one-to-one from those offsets, and audio is carried by a separate AUDIO_INDEX
+# read afterwards. Verified against MotionCam's published sample file, where the
+# footer reports 116 frames and the index region is exactly 116 * 16 bytes.
+
+_MCRAW_IDENT   = b"MOTION "
+_MCRAW_MAGIC   = 0x8A905612
+_TYPE_BUFFER_INDEX = 0
+_TYPE_METADATA     = 3
+_ITEM   = struct.Struct("<II")     # type, size
+_BUFIDX = struct.Struct("<IiQ")    # magic, numOffsets, indexDataOffset
+_FOOTER = _ITEM.size + _BUFIDX.size          # 24
+
+
+def probe_mcraw(path: Path) -> dict | None:
+    """
+    Read frame count and camera metadata from a .mcraw without decoding it.
+
+    Returns {'frames': int, 'version': int, 'metadata': dict|None}, or None if
+    the file cannot be parsed. Probing is strictly an optimisation -- it only
+    drives the progress bar and a post-decode sanity check -- so every failure
+    path degrades to None rather than raising and stopping a decode that would
+    otherwise have worked.
+    """
+    try:
+        with open(path, "rb") as f:
+            head = f.read(8)
+            if len(head) < 8 or head[:7] != _MCRAW_IDENT:
+                return None
+            version = head[7]
+
+            metadata = None
+            item = f.read(_ITEM.size)
+            if len(item) == _ITEM.size:
+                itype, isize = _ITEM.unpack(item)
+                if itype == _TYPE_METADATA and 0 < isize <= (8 << 20):
+                    try:
+                        metadata = json.loads(f.read(isize).decode("utf-8", "replace"))
+                    except ValueError:
+                        metadata = None
+
+            if os.fstat(f.fileno()).st_size < _FOOTER:
+                return None
+            f.seek(-_FOOTER, os.SEEK_END)
+            tail = f.read(_FOOTER)
+            if len(tail) < _FOOTER:
+                return None
+            itype, _ = _ITEM.unpack(tail[:_ITEM.size])
+            magic, n_offsets, _ = _BUFIDX.unpack(tail[_ITEM.size:])
+            if itype != _TYPE_BUFFER_INDEX or magic != _MCRAW_MAGIC or n_offsets < 0:
+                return None
+            return {"frames": n_offsets, "version": version, "metadata": metadata}
+    except (OSError, struct.error):
+        return None
+
+
+def _watch_frames(out_dir: Path, total: int, stop_evt: threading.Event,
+                  poll: float = 0.25) -> None:
+    """
+    Drive an inner progress bar by counting .dng files as the decoder writes
+    them. The decoder reports no progress of its own, so the output directory
+    is the only observable.
+    """
+    with tqdm(total=total, desc="   frames", unit="frame",
+              leave=False, position=1) as bar:
+        seen = 0
+        while True:
+            try:
+                n = sum(1 for e in os.scandir(out_dir)
+                        if e.name.lower().endswith(".dng"))
+            except OSError:
+                n = seen
+            n = min(n, total)
+            if n > seen:
+                bar.update(n - seen)
+                seen = n
+            if stop_evt.is_set():
+                return
+            stop_evt.wait(poll)
 
 
 def resolve_inputs(path: Path) -> list[Path]:
@@ -124,11 +222,14 @@ def _apply_cli_overrides() -> None:
 # Decode one file                                                               #
 # --------------------------------------------------------------------------- #
 
-def decode_one(mcraw: Path, out_dir: Path) -> int:
+def decode_one(mcraw: Path, out_dir: Path, expected_frames: int | None = None) -> int:
     """
-    Run EXAMPLE_BIN on a single .mcraw file.
+    Run DECODER_BIN on a single .mcraw file.
     Returns the number of .dng files written to out_dir.
     Raises RuntimeError on non-zero exit.
+
+    When expected_frames is known (from probe_mcraw), a watcher thread counts
+    output .dng files to drive a per-frame progress bar alongside the decode.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -136,12 +237,24 @@ def decode_one(mcraw: Path, out_dir: Path) -> int:
     if NUM_FRAMES is not None:
         cmd += ["--num-frames", str(NUM_FRAMES)]
 
-    result = subprocess.run(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
+    stop_evt = watcher = None
+    if expected_frames and _HAS_TQDM:
+        stop_evt = threading.Event()
+        watcher  = threading.Thread(target=_watch_frames,
+                                    args=(out_dir, expected_frames, stop_evt),
+                                    daemon=True)
+        watcher.start()
+    try:
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    finally:
+        if stop_evt is not None:
+            stop_evt.set()
+            watcher.join(timeout=2.0)
 
     if result.stderr.strip():
         for line in result.stderr.strip().splitlines():
@@ -189,21 +302,32 @@ def main() -> None:
 
     # The bar carries the running count, so per-file lines only report outcomes.
     bar = tqdm(mcraw_files, desc="decoding", unit="file",
-               disable=not _HAS_TQDM)
+               disable=not _HAS_TQDM, position=0)
     for mcraw in bar:
         if _HAS_TQDM:
             bar.set_postfix_str(mcraw.name[:40])
         out_dir = output_root / mcraw.stem
         size_mb = mcraw.stat().st_size / 1024 / 1024
 
+        info     = probe_mcraw(mcraw)
+        n_frames = info["frames"] if info else None
+        expected = n_frames
+        if expected is not None and NUM_FRAMES is not None:
+            expected = min(expected, NUM_FRAMES)
+
         try:
-            n_dng = decode_one(mcraw, out_dir)
+            n_dng = decode_one(mcraw, out_dir, expected)
             total_dngs += n_dng
             _write(f"  ✓ {mcraw.name}  ({size_mb:.1f} MB)  →  {out_dir}"
                    f"  [{n_dng} DNG]")
             if n_dng == 0:
                 _write(f"  WARNING: decoder succeeded but no .dng files "
                        f"found in {out_dir}")
+            elif expected is not None and n_dng != expected:
+                # The container's own index says how many frames it holds, so a
+                # short decode is detectable here rather than downstream.
+                _write(f"  WARNING: {mcraw.name} contains {expected} frame(s) "
+                       f"but {n_dng} DNG(s) were written")
         except RuntimeError as exc:
             _write(f"  FAILED: {mcraw.name}: {exc}")
             failures.append(mcraw)

@@ -23,6 +23,23 @@ import subprocess
 import sys
 from pathlib import Path
 
+try:
+    from tqdm import tqdm
+    _HAS_TQDM = True
+except ImportError:                      # decoding often runs on a machine
+    _HAS_TQDM = False                    # without the analysis dependencies
+
+    def tqdm(iterable, **_kwargs):       # passthrough so the loop is unchanged
+        return iterable
+
+
+def _write(msg: str) -> None:
+    """Print without corrupting the progress bar."""
+    if _HAS_TQDM:
+        tqdm.write(msg)
+    else:
+        print(msg)
+
 # ============================================================
 # CONFIG — edit paths here
 # ============================================================
@@ -128,7 +145,7 @@ def decode_one(mcraw: Path, out_dir: Path) -> int:
 
     if result.stderr.strip():
         for line in result.stderr.strip().splitlines():
-            print(f"    [stderr] {line}")
+            _write(f"    [stderr] {line}")
 
     if result.returncode != 0:
         raise RuntimeError(
@@ -170,20 +187,25 @@ def main() -> None:
     failures = []
     total_dngs = 0
 
-    for i, mcraw in enumerate(mcraw_files, 1):
+    # The bar carries the running count, so per-file lines only report outcomes.
+    bar = tqdm(mcraw_files, desc="decoding", unit="file",
+               disable=not _HAS_TQDM)
+    for mcraw in bar:
+        if _HAS_TQDM:
+            bar.set_postfix_str(mcraw.name[:40])
         out_dir = output_root / mcraw.stem
         size_mb = mcraw.stat().st_size / 1024 / 1024
-        print(f"[{i}/{len(mcraw_files)}] {mcraw.name}  ({size_mb:.1f} MB)")
-        print(f"          → {out_dir}")
 
         try:
             n_dng = decode_one(mcraw, out_dir)
             total_dngs += n_dng
-            print(f"          ✓ {n_dng} DNG(s) written")
+            _write(f"  ✓ {mcraw.name}  ({size_mb:.1f} MB)  →  {out_dir}"
+                   f"  [{n_dng} DNG]")
             if n_dng == 0:
-                print(f"  WARNING: decoder succeeded but no .dng files found in {out_dir}")
+                _write(f"  WARNING: decoder succeeded but no .dng files "
+                       f"found in {out_dir}")
         except RuntimeError as exc:
-            print(f"  FAILED: {exc}")
+            _write(f"  FAILED: {mcraw.name}: {exc}")
             failures.append(mcraw)
 
     print()

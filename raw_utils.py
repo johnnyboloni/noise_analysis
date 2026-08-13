@@ -316,6 +316,32 @@ def highpass_std(frame: np.ndarray, pattern: np.ndarray, ksize: int = 5) -> floa
     return float(np.mean(resid_stds))
 
 
+def bayer_plane_median3(frame: np.ndarray, pattern: np.ndarray) -> np.ndarray:
+    """
+    3×3 median of each Bayer sub-plane, reassembled into a full-size frame.
+
+    Per sub-plane, never across the raw mosaic: a median taken over mosaic
+    neighbours mixes colour channels, so on a coloured scene every pixel looks
+    like an outlier against its differently-coloured surroundings.
+
+    Used both to find defects (a pixel far from its same-colour neighbours) and
+    to repair them (replace it with their median).
+    """
+    out = np.empty_like(frame, dtype=np.float32)
+    for r in range(2):
+        for c in range(2):
+            plane = np.ascontiguousarray(frame[r::2, c::2], dtype=np.float32)
+            if _HAS_CV2:
+                out[r::2, c::2] = cv2.medianBlur(plane, 3)
+            else:
+                pad = np.pad(plane, 1, mode="edge")
+                stack = np.stack([pad[i:i + plane.shape[0], j:j + plane.shape[1]]
+                                  for i in range(3) for j in range(3)])
+                out[r::2, c::2] = np.median(stack, axis=0)
+                del stack
+    return out
+
+
 def save_rgb_png(rgb: np.ndarray, out: Path) -> None:
     """
     Save an H×W×3 RGB array (float32 in [0, 1], or uint8) as a PNG at exact

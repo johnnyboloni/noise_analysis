@@ -52,7 +52,7 @@ from raw_utils import (
     get_raw_metadata, get_raw_metadata_gn3, get_color_metadata,
     load_raw, load_raw_gn3, load_raw_rgb, load_raw_rgb_gn3,
     calibrate_frame, demosaic_to_rgb, plot_sample_frames, save_rgb_png,
-    highpass_std,
+    highpass_std, bayer_plane_median3,
 )
 
 
@@ -85,6 +85,9 @@ DARK_MAX_FRAMES = None  # how many dark frames to average. None = all of them,
                         # own data calls for).
 DARK_SIGMA_CLIP = 4.0   # reject dark samples beyond this many sigma from the
                         # per-pixel mean (cosmic rays, dropped frames)
+HOT_PIXEL_SIGMA = 5.0   # flag master-dark pixels this many residual-sigma from
+                        # their same-colour neighbours as defects, and repair
+                        # them by interpolation. 0 or None = skip.
 STILLS_DIR      = None  # dir of gain=1 long-exposure stills to compare against.
                         # None = skip the comparison.
 MATCH_STILL_INTENSITY = True   # rescale the stills by a robust ratio so the
@@ -342,6 +345,54 @@ def _dark_master_residual(paths, n_used, loader, black, white):
     b = loader(paths[1]).astype(np.float64)
     sigma1 = float((a - b).std()) / np.sqrt(2.0)
     return sigma1 / np.sqrt(n_used) / float(white - black[0])
+
+
+def _defect_map(dark_adu, pattern, resid_adu, n_sigma):
+    """
+    Locate defective pixels in the master dark.
+
+    A dark frame has no scene, so a pixel far from its same-colour neighbours
+    there is a sensor defect and nothing else. That is what makes this test
+    reliable where the same test on a light frame is not: on a light frame a
+    hot pixel and a genuine single-pixel highlight are spatially identical, and
+    no threshold separates them.
+
+    Sensitivity is set by the master's own residual noise, sigma1/sqrt(N_dark),
+    not by the per-frame noise -- which is the whole reason to detect here
+    rather than per frame. With a few hundred darks that is an order of
+    magnitude finer, and it reaches the mildly-hot pixels that dominate by
+    count and are invisible in any single frame.
+
+    Returns (mask, n_hot, n_cold). Cold (stuck-low) pixels are flagged too;
+    they are equally wrong in the output and cost nothing extra to find.
+    """
+    med  = bayer_plane_median3(dark_adu, pattern)
+    dev  = dark_adu - med
+    thr  = n_sigma * resid_adu
+    hot  = dev > thr
+    cold = dev < -thr
+    return (hot | cold), int(hot.sum()), int(cold.sum())
+
+
+def _interpolate_defects(frame, pattern, mask):
+    """Replace flagged pixels with the median of their same-colour neighbours."""
+    if not mask.any():
+        return frame
+    med = bayer_plane_median3(frame, pattern)
+    return np.where(mask, med, frame).astype(np.float32)
+
+
+def _plot_defect_map(mask, n_hot, n_cold, out):
+    fig, ax = plt.subplots(figsize=(9, 6))
+    ax.imshow(mask, cmap="gray", interpolation="nearest")
+    frac = mask.mean() * 100
+    ax.set_title(f"Defect map from master dark — {n_hot} hot, {n_cold} cold "
+                 f"({frac:.4f}% of pixels)", fontsize=11)
+    ax.axis("off")
+    fig.tight_layout()
+    fig.savefig(out, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved {out}")
 
 
 def _dark_correct(light_adu, dark_adu, pattern, black, white):
@@ -1138,6 +1189,28 @@ def analyze_gt_sequence(
         if hp_after >= hp_before:
             print("  WARNING: dark subtraction made the frame NOISIER — prefer "
                   "the plain mean, or capture more darks.")
+
+        # Defect map: detected in the master dark, repaired in the light frame.
+        if HOT_PIXEL_SIGMA and resid is not None:
+            resid_adu = resid * float(white - black[0])
+            mask, n_hot, n_cold = _defect_map(dark_adu, pattern, resid_adu,
+                                              HOT_PIXEL_SIGMA)
+            print(f"\n  Defect map (>{HOT_PIXEL_SIGMA}σ from same-colour "
+                  f"neighbours in the master dark): "
+                  f"{n_hot} hot, {n_cold} cold, {mask.mean() * 100:.4f}% of pixels")
+            if mask.any():
+                defect_fixed = _interpolate_defects(dark_corrected, pattern, mask)
+                hp_fixed = highpass_std(defect_fixed, pattern)
+                print(f"  High-pass std   dark-subtracted={hp_after:.6f}  "
+                      f"defects-interpolated={hp_fixed:.6f}  "
+                      f"({(1 - hp_fixed / hp_after) * 100:+.1f}%)")
+                _plot_defect_map(mask, n_hot, n_cold,
+                                 seq_out / "gt_defect_map.png")
+                np.save(seq_out / "gt_defect_map.npy", mask)
+                _save_rgb_frame(defect_fixed, pattern,
+                                seq_out / f"gt_mean_darksub_defectfix_rgb_N{n}.png",
+                                wb, ccm)
+                dark_corrected = defect_fixed
 
     # ---------------------------------------------------------------- #
     # Comparison of GT candidates                                        #

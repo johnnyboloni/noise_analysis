@@ -1,7 +1,8 @@
 """
 Batch-decode .mcraw files using the motioncam-decoder example binary.
 
-For each .mcraw found under INPUT_DIR the script:
+INPUT_PATH may be either a single .mcraw file or a directory, which is searched
+recursively for *.mcraw. For each file found the script:
   1. Creates  OUTPUT_ROOT/<stem>/
   2. Runs     DECODER_BIN  <file>  -o <out_subdir>  [--num-frames N]
   3. Counts resulting .dng files as a sanity check
@@ -11,7 +12,10 @@ Edit the CONFIG block below, then run:
     python batch_decode_mcraw.py
 
 All CONFIG constants can also be overridden via CLI flags, e.g.:
-    python batch_decode_mcraw.py --num-frames 50 --output-root /tmp/out
+    python batch_decode_mcraw.py --input-path /data/clip.mcraw --num-frames 50
+    python batch_decode_mcraw.py --input-path /data/captures --output-root /tmp/out
+
+--input-dir is accepted as an alias for --input-path.
 """
 
 import argparse
@@ -22,11 +26,29 @@ from pathlib import Path
 # ============================================================
 # CONFIG — edit paths here
 # ============================================================
-INPUT_DIR   = "/path/to/mcraw/files"   # searched recursively for *.mcraw
+INPUT_PATH  = "/path/to/mcraw/files"   # a single .mcraw file, or a directory
+                                       # searched recursively for *.mcraw
 OUTPUT_ROOT = "/path/to/output"        # one subdir per capture created here
 DECODER_BIN = "decoder"               # path to motioncam-decoder binary
 NUM_FRAMES  = None                     # int to decode only first N frames; None = all
 # ============================================================
+
+
+def resolve_inputs(path: Path) -> list[Path]:
+    """
+    Return the .mcraw files to decode.
+
+    A file resolves to itself, a directory to every *.mcraw beneath it. The
+    suffix is checked case-insensitively so an explicitly named .MCRAW is not
+    rejected, while directory globbing covers both cases too.
+    """
+    if path.is_file():
+        if path.suffix.lower() != ".mcraw":
+            sys.exit(f"ERROR: not a .mcraw file: {path}")
+        return [path]
+    if path.is_dir():
+        return sorted(set(path.rglob("*.mcraw")) | set(path.rglob("*.MCRAW")))
+    sys.exit(f"ERROR: input path does not exist: {path}")
 
 
 # --------------------------------------------------------------------------- #
@@ -68,6 +90,12 @@ def _apply_cli_overrides() -> None:
         else:
             parser.add_argument(flag, dest=key, type=_none_or_auto, default=None, metavar="S",
                                 help=f"(default: {val!r}; 'none' to clear)")
+
+    # Back-compat: INPUT_DIR was renamed to INPUT_PATH when single files became
+    # valid input. Same dest, so either spelling sets the same value.
+    parser.add_argument("--input-dir", dest="INPUT_PATH", type=_none_or_auto,
+                        default=None, metavar="S",
+                        help="alias for --input-path")
 
     args = parser.parse_args()
     for key, new_val in vars(args).items():
@@ -120,17 +148,17 @@ def decode_one(mcraw: Path, out_dir: Path) -> int:
 def main() -> None:
     _apply_cli_overrides()
 
-    input_dir   = Path(INPUT_DIR)
+    input_path  = Path(INPUT_PATH)
     output_root = Path(OUTPUT_ROOT)
 
-    if not input_dir.exists():
-        sys.exit(f"ERROR: INPUT_DIR does not exist: {input_dir}")
-
-    mcraw_files = sorted(input_dir.rglob("*.mcraw"))
+    mcraw_files = resolve_inputs(input_path)
     if not mcraw_files:
-        sys.exit(f"No .mcraw files found under {input_dir}")
+        sys.exit(f"No .mcraw files found under {input_path}")
 
-    print(f"Found {len(mcraw_files)} .mcraw file(s) in {input_dir}")
+    if input_path.is_file():
+        print(f"Decoding single file: {input_path}")
+    else:
+        print(f"Found {len(mcraw_files)} .mcraw file(s) under {input_path}")
     print(f"Output root : {output_root}")
     print(f"Decoder     : {DECODER_BIN}")
     if NUM_FRAMES is not None:

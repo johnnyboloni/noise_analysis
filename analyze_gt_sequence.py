@@ -90,6 +90,12 @@ COMPARISON_CROP = 400   # centre-crop size (px) for the 100%-zoom comparison
 SAVE_DNG        = True  # write a .dng next to every GT candidate PNG, in raw
                         # ADU with the black pedestal restored, so downstream
                         # tools read it exactly like an original capture
+SAVE_NPY        = True  # write a .npy too: the calibrated float32 frame, before
+                        # the integer rounding a DNG imposes. At 10-bit that
+                        # rounding costs ~0.00065 in calibrated units, which is
+                        # the same order as the temporal noise left after a few
+                        # hundred frames -- so use the .npy, not the .dng, when
+                        # computing metrics against the GT.
 # ============================================================
 
 
@@ -884,6 +890,11 @@ def analyze_gt_sequence(
 
     def save_candidate(frame, png_path):
         _save_rgb_frame(frame, pattern, png_path, wb, ccm)
+        if SAVE_NPY:
+            npy_path = png_path.with_name(
+                png_path.stem.replace('_rgb', '') + '.npy')
+            np.save(npy_path, frame.astype(np.float32))
+            print(f"Saved {npy_path}")
         if SAVE_DNG:
             # Drop the "_rgb" marker from the DNG's name -- it describes the
             # PNG's demosaiced content, not the Bayer data in the DNG.

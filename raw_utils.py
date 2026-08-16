@@ -370,6 +370,50 @@ def bayer_plane_median3(frame: np.ndarray, pattern: np.ndarray) -> np.ndarray:
     return out
 
 
+#: Cubic (Lagrange) weights for estimating a sample from its neighbours at
+#: -2, -1, +1, +2 -- the centre is excluded because that is the defect being
+#: replaced. Derived by evaluating the Lagrange basis for those four nodes at
+#: 0; they sum to 1, so a flat region is reproduced exactly.
+_CUBIC_W = (-1.0 / 6.0, 2.0 / 3.0, 2.0 / 3.0, -1.0 / 6.0)
+
+
+def cubic_fill_plane(plane: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """
+    Replace masked samples by cubic interpolation from their neighbours.
+
+    Operates on a single Bayer sub-plane, so neighbours at +-1 and +-2 here are
+    +-2 and +-4 in full-frame coordinates -- all the same colour channel.
+
+    The horizontal and vertical cubic estimates are averaged, which is stabler
+    than either alone near an edge. Neighbours that are themselves masked will
+    contaminate the estimate; that is fine for isolated defects and degrades
+    gracefully for small clusters.
+    """
+    if not mask.any():
+        return plane
+    H, W = plane.shape
+    p = np.pad(plane.astype(np.float32), 2, mode="edge")
+    horiz = sum(w * p[2:2 + H, o:o + W]
+                for w, o in zip(_CUBIC_W, (0, 1, 3, 4)))
+    vert = sum(w * p[o:o + H, 2:2 + W]
+               for w, o in zip(_CUBIC_W, (0, 1, 3, 4)))
+    return np.where(mask, 0.5 * (horiz + vert), plane).astype(np.float32)
+
+
+def cubic_fill_bayer(frame: np.ndarray, pattern: np.ndarray,
+                     mask: np.ndarray) -> np.ndarray:
+    """Apply cubic_fill_plane to each Bayer sub-plane of a full frame."""
+    out = frame.astype(np.float32).copy()
+    for r in range(2):
+        for c in range(2):
+            sub_mask = mask[r::2, c::2]
+            if sub_mask.any():
+                out[r::2, c::2] = cubic_fill_plane(
+                    np.ascontiguousarray(frame[r::2, c::2], dtype=np.float32),
+                    sub_mask)
+    return out
+
+
 def uncalibrate_frame(cal: np.ndarray, pattern: np.ndarray,
                       black: np.ndarray, white: float) -> np.ndarray:
     """

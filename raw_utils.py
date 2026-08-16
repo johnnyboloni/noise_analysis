@@ -447,42 +447,42 @@ def get_dng_color_matrix(path: Path) -> np.ndarray | None:
         return None
 
 
-#: Tags copied verbatim from a source DNG so the output is colour-identical to
-#: the capture it came from. Converters resolve colour from the camera identity
-#: (Make/Model/UniqueCameraModel) against their own profile database, not only
-#: from ColorMatrix1 -- verified: a file naming an unknown camera gets no
-#: profile at all, while one naming a known camera gets that camera's matrix
-#: regardless of the ColorMatrix1 written into it. So identity has to travel
-#: with the colour tags, or the output is orphaned and renders wrong.
-_DNG_COLOR_TAGS = (
-    271,    # Make
-    272,    # Model
-    50708,  # UniqueCameraModel
-    50709,  # LocalizedCameraModel
-    50721,  # ColorMatrix1
-    50722,  # ColorMatrix2
-    50723,  # CameraCalibration1
-    50724,  # CameraCalibration2
-    50725,  # ReductionMatrix1
-    50726,  # ReductionMatrix2
-    50727,  # AnalogBalance
-    50728,  # AsShotNeutral -- the capture's own white balance
-    50778,  # CalibrationIlluminant1
-    50779,  # CalibrationIlluminant2
-    50964,  # ForwardMatrix1
-    50965,  # ForwardMatrix2
-    50936,  # ProfileName
-    50941,  # ProfileEmbedPolicy
-)
+#: Tags that must describe OUR pixel data, so they are never copied from the
+#: source. Everything else is passed through verbatim -- a blocklist rather than
+#: an allowlist, because colour rendering depends on more tags than is obvious
+#: (profiles, tone curves, hue maps, baseline exposure, CFA layout ...) and any
+#: one of them missing sends a converter down a different path. Pointer-valued
+#: tags are excluded too: their offsets refer to the source file's layout and
+#: would dangle in ours.
+_DNG_STRUCTURAL_TAGS = frozenset({
+    254, 256, 257, 258, 259, 262,          # subfile type, size, depth, photometric
+    273, 277, 278, 279, 284,               # strips, samples, planar config
+    322, 323, 324, 325,                    # tiles
+    330,                                   # SubIFDs (pointer)
+    513, 514,                              # JPEG interchange (pointer)
+    33422,                                 # CFAPattern -- written from our pattern
+    50713, 50714, 50715, 50716, 50717,     # black/white levels and deltas
+    50718, 50719, 50720,                   # default scale / crop
+    50829, 50830,                          # ActiveArea, MaskedAreas
+    34665, 34853,                          # Exif / GPS IFD (pointers)
+    37500,                                 # MakerNote (may hold offsets)
+})
 
 
-def read_dng_color_tags(path: Path) -> list:
+def read_dng_passthrough_tags(path: Path) -> list:
     """
-    Read the colour/identity tags from a DNG as tifffile `extratags` tuples.
+    Read every non-structural tag from a source DNG as tifffile `extratags`.
 
-    Returned verbatim -- original TIFF type and value -- so save_dng can re-emit
-    them without reinterpreting anything. Anything unreadable is skipped rather
-    than guessed at.
+    Colour is not carried by ColorMatrix1 alone. Converters look the camera up
+    by identity (Make / Model / UniqueCameraModel) against their own profile
+    database, and then apply whatever profile tags the file provides -- tone
+    curve, hue/sat maps, look table, baseline exposure, CFA layout. Copying a
+    hand-picked subset leaves the rest at defaults and renders differently from
+    the original, so everything that is not about our pixel geometry is passed
+    through untouched.
+
+    Values are re-emitted with their original TIFF type. Anything unreadable is
+    skipped rather than guessed at; the whole function degrades to [].
     """
     try:
         import tifffile
@@ -491,22 +491,29 @@ def read_dng_color_tags(path: Path) -> list:
     out = []
     try:
         with tifffile.TiffFile(str(path)) as tf:
-            tags = tf.pages[0].tags
-            for code in _DNG_COLOR_TAGS:
-                tag = tags.get(code)
-                if tag is None or tag.value is None:
+            for tag in tf.pages[0].tags:
+                if tag.code in _DNG_STRUCTURAL_TAGS or tag.value is None:
                     continue
                 value = tag.value
-                count = tag.count
                 if isinstance(value, str):
-                    out.append((code, 's', 0, value, True))
+                    out.append((tag.code, 's', 0, value, True))
+                elif isinstance(value, bytes):
+                    out.append((tag.code, int(tag.dtype), tag.count, value, True))
                 else:
-                    if isinstance(value, (int, float, bytes)):
-                        value = (value,) if not isinstance(value, bytes) else value
-                    out.append((code, int(tag.dtype), count, value, True))
+                    if isinstance(value, (int, float)):
+                        value = (value,)
+                    try:
+                        out.append((tag.code, int(tag.dtype), tag.count,
+                                    tuple(np.asarray(value).ravel().tolist()), True))
+                    except Exception:
+                        continue
     except Exception:
         return []
     return out
+
+
+# Kept as an alias: the earlier name is still what analyze_gt_sequence imports.
+read_dng_color_tags = read_dng_passthrough_tags
 
 
 def _dng_rationals(values, denom: int = 10000):
@@ -556,7 +563,14 @@ def save_dng(adu: np.ndarray, out: Path, pattern: np.ndarray,
 
     cfa = bytes([{0: 0, 1: 1, 2: 2, 3: 1}[int(pattern[r, c])]
                  for r in range(2) for c in range(2)])
-    bl = np.asarray(black, dtype=float).ravel()
+    # BlackLevel with BlackLevelRepeatDim is in SPATIAL row-major order, while
+    # rawpy indexes black_level_per_channel by COLOUR (0=R 1=G 2=B 3=G2). Those
+    # orders differ whenever the pattern is not literally [[0,1],[2,3]], so the
+    # values have to be re-ordered by position or two of them land swapped.
+    bl_by_colour = np.asarray(black, dtype=float).ravel()
+    bl = np.array([bl_by_colour[int(pattern[r, c])]
+                   for r in range(2) for c in range(2)]
+                  if bl_by_colour.size >= 4 else bl_by_colour, dtype=float)
 
     tags = [
         (33421, 'H', 2, (2, 2), True),                  # CFARepeatPatternDim
@@ -573,10 +587,15 @@ def save_dng(adu: np.ndarray, out: Path, pattern: np.ndarray,
     else:
         tags.append((50714, 'H', 1, (int(round(bl[0])),), True))
 
-    copied = {t[0] for t in (copy_tags or ())}
+    # Drop any copied tag whose code we already emit ourselves. A TIFF IFD must
+    # not carry the same tag twice; duplicates are malformed and readers may take
+    # either one.
+    base_codes = {t[0] for t in tags}
+    copy_tags  = [t for t in (copy_tags or ()) if t[0] not in base_codes]
+    copied     = {t[0] for t in copy_tags}
     if copy_tags:
-        # The capture's own colour and identity tags, verbatim.
-        tags += list(copy_tags)
+        # The capture's own colour, identity and profile tags, verbatim.
+        tags += copy_tags
     else:
         tags.append((50708, 's', 0, model, True))   # UniqueCameraModel
     if 50721 not in copied:

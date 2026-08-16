@@ -32,6 +32,11 @@ Outputs (saved to OUTPUT_DIR):
                              and FPN cancel in the subtraction)
   - gt_defect_map.png/.npy : hot/cold pixels found in the master dark
                              (only when DARK_DIR is set)
+  - gt_stationarity_*.png  : frame level over the run, plus a first-half vs
+                             second-half check. Averaging assumes every frame
+                             shows the same thing; if the sensor warmed or the
+                             lighting drifted, that error does not average away
+                             and the split-half noise estimate cannot see it.
 
 Correction order matters and is fixed: average, then subtract the dark, then
 interpolate defects. Interpolating before the subtraction removes a defect's
@@ -171,6 +176,18 @@ def _stream_mean(paths, pattern, black, white, loader,
     metrics = []
     n = len(paths)
 
+    # Stationarity accumulators, on a decimated grid (step 4 keeps Bayer phase,
+    # 1/16 the memory). Alongside the even/odd split we keep a first-half /
+    # second-half split: even/odd is deliberately blind to slow drift, since
+    # interleaving means both halves warm up equally, so it cannot tell whether
+    # the sequence stayed stationary. First/second is maximally sensitive to it,
+    # and the two are directly comparable because the group sizes match.
+    DEC = 4
+    dec_acc = {'e': None, 'o': None, 'f1': None, 'f2': None}
+    dec_n   = {'e': 0, 'o': 0, 'f1': 0, 'f2': 0}
+    half    = n // 2
+    frame_levels = []
+
     for i, p in enumerate(progress(paths, desc="  mean")):
         idx = i + 1
         raw = loader(p).astype(np.float64)
@@ -180,6 +197,12 @@ def _stream_mean(paths, pattern, black, white, loader,
         else:
             acc_o = raw if acc_o is None else acc_o + raw
             n_o += 1
+
+        frame_levels.append(float(raw.mean()))
+        dec = raw[::DEC, ::DEC]
+        for key in ('e' if i % 2 == 0 else 'o', 'f1' if i < half else 'f2'):
+            dec_acc[key] = dec.copy() if dec_acc[key] is None else dec_acc[key] + dec
+            dec_n[key] += 1
 
         if idx in checkpoints:
             total   = acc_e if acc_o is None else acc_e + acc_o
@@ -209,7 +232,10 @@ def _stream_mean(paths, pattern, black, white, loader,
     mean_adu = (total / n).astype(np.float32)
     # The raw-ADU mean is returned alongside the calibrated one because dark
     # subtraction has to happen before black-level removal (see _dark_correct).
-    return calibrate_frame(mean_adu, pattern, black, white), mean_adu, metrics
+    stationarity = {'dec_acc': dec_acc, 'dec_n': dec_n,
+                    'levels': np.array(frame_levels, dtype=np.float64)}
+    return (calibrate_frame(mean_adu, pattern, black, white), mean_adu,
+            metrics, stationarity)
 
 
 def _checkpoint_metrics(idx, half_diff, n_e, n_o, running, pattern):
@@ -679,6 +705,71 @@ def _report_floor(metrics, margins=(3.0, 5.0)):
     print()
 
 
+def _report_stationarity(st, white, black, out):
+    """
+    Did the capture stay stationary for its whole length?
+
+    Averaging assumes every frame shows the same thing. Over a long run the
+    sensor warms, dark current grows, lighting can drift -- and none of that
+    averages away. The even/odd split-half estimator cannot see it: interleaved
+    halves warm equally, which is exactly what makes it a good noise estimator
+    and a useless drift detector.
+
+    So compare the first half against the second. Both splits have the same
+    group sizes, so under a stationary capture their differences must have the
+    same magnitude. Two statistics, because drift has two components:
+
+      level   -- mean of (first - second). Catches a uniform shift in level.
+                 By far the more sensitive of the two: its noise floor is the
+                 per-pixel floor divided by sqrt(number of pixels).
+      pattern -- std of (first - second) over std of (even - odd). Catches
+                 differential growth, e.g. hot pixels warming faster than the
+                 rest. Expected ~1.0 when stationary.
+    """
+    a, k = st['dec_acc'], st['dec_n']
+    if a['o'] is None or a['f2'] is None or min(k.values()) == 0:
+        return
+    scale = float(white - black[0])
+    d_eo = (a['e'] / k['e'] - a['o'] / k['o']) / scale
+    d_fs = (a['f1'] / k['f1'] - a['f2'] / k['f2']) / scale
+
+    level    = float(abs(d_fs.mean()))
+    floor    = float(d_eo.std()) / np.sqrt(d_eo.size)
+    ratio    = float(d_fs.std() / d_eo.std()) if d_eo.std() > 0 else float('nan')
+    drifting = level > 5 * floor or ratio > 1.3
+
+    print("\n  Stationarity (first half vs second half)")
+    print(f"    level shift            : {level:.6f}   "
+          f"({level / floor:.1f}x the {floor:.6f} noise floor)")
+    print(f"    pattern std ratio      : {ratio:.2f}   (1.0 = stationary)")
+    if drifting:
+        print("    -> the capture DRIFTED. Frames late in the run do not show "
+              "the same thing as frames early on,")
+        print("       and that error does not average away. Prefer a shorter "
+              "run, or split it and check each part.")
+    else:
+        print("    -> stationary; the whole run can be averaged safely.")
+
+    levels = st['levels'] / scale
+    fig, ax = plt.subplots(figsize=(9, 4.4))
+    ax.plot(levels, linewidth=0.9, color="steelblue")
+    if len(levels) > 20:                       # running mean to expose slow trends
+        w = max(5, len(levels) // 40)
+        ker = np.ones(w) / w
+        ax.plot(np.arange(w - 1, len(levels)), np.convolve(levels, ker, 'valid'),
+                linewidth=2.0, color="crimson", label=f"{w}-frame running mean")
+        ax.legend(fontsize=9)
+    ax.set_xlabel("Frame index", fontsize=11)
+    ax.set_ylabel("Frame mean level [calibrated]", fontsize=11)
+    ax.set_title(f"Capture stationarity — level shift {level / floor:.1f}x floor, "
+                 f"pattern ratio {ratio:.2f}", fontsize=12)
+    ax.grid(True, alpha=0.3, linestyle="--")
+    fig.tight_layout()
+    fig.savefig(out, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved {out}")
+
+
 def _plot_checkpoint_noise(metrics, out):
     """
     Measured noise vs frames averaged, with a 1/sqrt(N) reference.
@@ -876,7 +967,7 @@ def analyze_gt_sequence(
 
     print(f"  Pass 1 — streaming mean ({n} frames), "
           f"checkpoints at N={ckpt_ns} …")
-    full_mean, full_mean_adu, ckpt_metrics = _stream_mean(
+    full_mean, full_mean_adu, ckpt_metrics, stationarity = _stream_mean(
         paths, pattern, black, white, loader,
         checkpoints=set(ckpt_ns), on_checkpoint=_on_checkpoint)
     print(f"  Mean range: [{full_mean.min():.4f}, {full_mean.max():.4f}]")
@@ -890,6 +981,8 @@ def analyze_gt_sequence(
     _print_checkpoint_table(ckpt_metrics)
     _plot_checkpoint_noise(ckpt_metrics,
                            seq_out / f"gt_checkpoint_noise_N{n}.png")
+    _report_stationarity(stationarity, white, black,
+                         seq_out / f"gt_stationarity_N{n}.png")
 
     # Median + trimmed mean (disk-backed, no full-stack RAM alloc)
     n_stack  = min(max_stack, n)

@@ -370,6 +370,111 @@ def bayer_plane_median3(frame: np.ndarray, pattern: np.ndarray) -> np.ndarray:
     return out
 
 
+def uncalibrate_frame(cal: np.ndarray, pattern: np.ndarray,
+                      black: np.ndarray, white: float) -> np.ndarray:
+    """
+    Inverse of calibrate_frame: calibrated [0, 1] back to raw ADU as uint16.
+
+    Restores the per-channel black pedestal, so the result sits in the same
+    numeric space as the frames it came from and can be written to a DNG that
+    downstream tools read exactly like an original capture.
+    """
+    out = np.empty(cal.shape, dtype=np.float64)
+    for r in range(2):
+        for c in range(2):
+            bl = float(black[int(pattern[r, c])])
+            out[r::2, c::2] = cal[r::2, c::2] * (white - bl) + bl
+    return np.clip(np.rint(out), 0, 65535).astype(np.uint16)
+
+
+def get_dng_color_matrix(path: Path) -> np.ndarray | None:
+    """
+    XYZ -> camera-RGB matrix for a DNG's ColorMatrix1 tag.
+
+    This is rawpy's rgb_xyz_matrix (LibRaw's cam_xyz), NOT color_matrix --
+    color_matrix goes camera -> sRGB, the opposite direction, and writing it
+    into ColorMatrix1 would give downstream converters wrong colour.
+    """
+    try:
+        with rawpy.imread(str(path)) as raw:
+            m = np.array(raw.rgb_xyz_matrix[:3, :3], dtype=np.float64)
+        return m if np.isfinite(m).all() and np.abs(m).sum() > 0 else None
+    except Exception:
+        return None
+
+
+def _dng_rationals(values, denom: int = 10000):
+    """Flatten floats into the (numerator, denominator) int pairs TIFF wants."""
+    out = []
+    for v in np.asarray(values, dtype=float).ravel():
+        out += [int(round(v * denom)), denom]
+    return tuple(out)
+
+
+def save_dng(adu: np.ndarray, out: Path, pattern: np.ndarray,
+             black: np.ndarray, white: float,
+             color_matrix: np.ndarray | None = None,
+             as_shot_neutral: np.ndarray | None = None,
+             model: str = "noise_analysis GT") -> None:
+    """
+    Write a Bayer frame as an uncompressed DNG.
+
+    DNG is a TIFF/EP variant, so this is tifffile plus the required DNG tags --
+    chosen over pidng because pidng ships a C extension that has to compile,
+    while the GN3 path additionally has no source DNG whose metadata could
+    simply be copied.
+
+    CFAPattern uses DNG's colour codes (0=R, 1=G, 2=B), so rawpy's second-green
+    marker (3) maps to 1; LibRaw reconstructs the G2 designation itself on read.
+
+    Verified round-trip through rawpy: pixels bit-exact, and raw_pattern,
+    black_level_per_channel and white_level all read back as written.
+    """
+    try:
+        import tifffile
+    except ImportError:
+        print(f"  SKIP {out.name}: tifffile is required to write DNG "
+              f"(pip install tifffile)")
+        return
+
+    if adu.dtype != np.uint16:
+        adu = np.clip(np.rint(adu), 0, 65535).astype(np.uint16)
+
+    cfa = bytes([{0: 0, 1: 1, 2: 2, 3: 1}[int(pattern[r, c])]
+                 for r in range(2) for c in range(2)])
+    bl = np.asarray(black, dtype=float).ravel()
+
+    tags = [
+        (33421, 'H', 2, (2, 2), True),                  # CFARepeatPatternDim
+        (33422, 'B', 4, cfa, True),                     # CFAPattern
+        (50706, 'B', 4, (1, 4, 0, 0), True),            # DNGVersion 1.4.0.0
+        (50707, 'B', 4, (1, 1, 0, 0), True),            # DNGBackwardVersion
+        (50708, 's', 0, model, True),                   # UniqueCameraModel
+        (50717, 'I', 1, (int(round(white)),), True),    # WhiteLevel
+        (50778, 'H', 1, (21,), True),                   # CalibrationIlluminant1 = D65
+    ]
+    # Per-channel black levels need the repeat-dim tag; a single shared value
+    # can be written on its own.
+    if bl.size >= 4 and not np.allclose(bl[:4], bl[0]):
+        tags += [(50713, 'H', 2, (2, 2), True),         # BlackLevelRepeatDim
+                 (50714, 'H', 4, tuple(int(round(v)) for v in bl[:4]), True)]
+    else:
+        tags.append((50714, 'H', 1, (int(round(bl[0])),), True))
+
+    if color_matrix is not None:
+        tags.append((50721, '2i', 9, _dng_rationals(color_matrix), True))
+    else:
+        # DNG requires ColorMatrix1; identity is the honest placeholder when the
+        # source carries no camera profile (e.g. GN3 .raw).
+        tags.append((50721, '2i', 9, _dng_rationals(np.eye(3)), True))
+    neutral = np.ones(3) if as_shot_neutral is None else np.asarray(as_shot_neutral)
+    tags.append((50728, '2i', 3, _dng_rationals(neutral), True))
+
+    tifffile.imwrite(str(out), adu, photometric='CFA', planarconfig='contig',
+                     compression=None, extratags=tags)
+    print(f"Saved {out}")
+
+
 def save_rgb_png(rgb: np.ndarray, out: Path) -> None:
     """
     Save an H×W×3 RGB array (float32 in [0, 1], or uint8) as a PNG at exact

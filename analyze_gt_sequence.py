@@ -49,6 +49,7 @@ from raw_utils import (
     load_raw, load_raw_gn3, load_raw_rgb, load_raw_rgb_gn3,
     calibrate_frame, demosaic_to_rgb, plot_sample_frames, save_rgb_png,
     highpass_std, bayer_plane_median3, progress, format_duration,
+    uncalibrate_frame, save_dng, get_dng_color_matrix,
 )
 
 
@@ -86,6 +87,9 @@ MATCH_STILL_INTENSITY = True   # rescale the stills by a robust ratio so the
                                # comparison is not dominated by an exposure
                                # mismatch between the two capture settings
 COMPARISON_CROP = 400   # centre-crop size (px) for the 100%-zoom comparison
+SAVE_DNG        = True  # write a .dng next to every GT candidate PNG, in raw
+                        # ADU with the black pedestal restored, so downstream
+                        # tools read it exactly like an original capture
 # ============================================================
 
 
@@ -870,11 +874,30 @@ def analyze_gt_sequence(
     _plot_differences(full_mean, median_frame, trimmed_frame,
                       seq_out / f"gt_differences_N{n}_stack{n_stack}.png")
 
-    # Full-resolution RGB saves (one file per aggregation method)
-    print("  Saving full-resolution RGB frames …")
-    _save_rgb_frame(full_mean,     pattern, seq_out / f"gt_mean_rgb_N{n}.png",              wb, ccm)
-    _save_rgb_frame(median_frame,  pattern, seq_out / f"gt_median_rgb_N{n_stack}.png",      wb, ccm)
-    _save_rgb_frame(trimmed_frame, pattern, seq_out / f"gt_trimmed_mean_rgb_N{n_stack}.png", wb, ccm)
+    # Full-resolution saves: an RGB PNG to look at, and a DNG to feed onward.
+    # The DNG carries the sequence's own black/white levels and camera profile,
+    # so a GT frame drops into the same tooling as an original capture.
+    dng_ccm = get_dng_color_matrix(paths[0]) if fmt == 'dng' else None
+    # AsShotNeutral is the camera-space value of a neutral patch, i.e. the
+    # reciprocal of the white-balance gains that get applied to reach neutral.
+    neutral = (1.0 / np.asarray(wb, dtype=float)) if wb is not None else None
+
+    def save_candidate(frame, png_path):
+        _save_rgb_frame(frame, pattern, png_path, wb, ccm)
+        if SAVE_DNG:
+            # Drop the "_rgb" marker from the DNG's name -- it describes the
+            # PNG's demosaiced content, not the Bayer data in the DNG.
+            dng_path = png_path.with_name(
+                png_path.stem.replace('_rgb', '') + '.dng')
+            save_dng(uncalibrate_frame(frame, pattern, black, white),
+                     dng_path, pattern, black, white,
+                     color_matrix=dng_ccm, as_shot_neutral=neutral,
+                     model=f"noise_analysis GT ({seq_name})")
+
+    print("  Saving full-resolution frames …")
+    save_candidate(full_mean,     seq_out / f"gt_mean_rgb_N{n}.png")
+    save_candidate(median_frame,  seq_out / f"gt_median_rgb_N{n_stack}.png")
+    save_candidate(trimmed_frame, seq_out / f"gt_trimmed_mean_rgb_N{n_stack}.png")
 
     # ---------------------------------------------------------------- #
     # Dark subtraction                                                   #
@@ -899,8 +922,8 @@ def analyze_gt_sequence(
               f"min={dark_adu.min():.2f}  max={dark_adu.max():.2f}  "
               f"(black level {black[0]:.1f})")
         dark_corrected = _dark_correct(full_mean_adu, dark_adu, pattern, black, white)
-        _save_rgb_frame(dark_corrected, pattern,
-                        seq_out / f"gt_mean_darksub_rgb_N{n}.png", wb, ccm)
+        save_candidate(dark_corrected,
+                       seq_out / f"gt_mean_darksub_rgb_N{n}.png")
 
         hp_before = highpass_std(full_mean, pattern)
         hp_after  = highpass_std(dark_corrected, pattern)
@@ -937,9 +960,8 @@ def analyze_gt_sequence(
                 _plot_defect_map(mask, n_hot, n_cold,
                                  seq_out / "gt_defect_map.png")
                 np.save(seq_out / "gt_defect_map.npy", mask)
-                _save_rgb_frame(defect_fixed, pattern,
-                                seq_out / f"gt_mean_darksub_defectfix_rgb_N{n}.png",
-                                wb, ccm)
+                save_candidate(defect_fixed,
+                               seq_out / f"gt_mean_darksub_defectfix_rgb_N{n}.png")
                 dark_corrected = defect_fixed
 
     # ---------------------------------------------------------------- #
@@ -975,7 +997,7 @@ def analyze_gt_sequence(
         for f, lab in zip(frames, labels):
             stem = (lab.split('(')[0].strip()
                        .replace('−', 'minus').replace(' ', '_'))
-            _save_rgb_frame(f, pattern, cmp_dir / f"cmp_{stem}.png", wb, ccm)
+            save_candidate(f, cmp_dir / f"cmp_{stem}.png")
 
         print("\n  Residual pixel noise (high-pass std, calibrated units)")
         for f, lab in zip(frames, labels):

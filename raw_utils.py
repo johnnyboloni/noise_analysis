@@ -447,6 +447,68 @@ def get_dng_color_matrix(path: Path) -> np.ndarray | None:
         return None
 
 
+#: Tags copied verbatim from a source DNG so the output is colour-identical to
+#: the capture it came from. Converters resolve colour from the camera identity
+#: (Make/Model/UniqueCameraModel) against their own profile database, not only
+#: from ColorMatrix1 -- verified: a file naming an unknown camera gets no
+#: profile at all, while one naming a known camera gets that camera's matrix
+#: regardless of the ColorMatrix1 written into it. So identity has to travel
+#: with the colour tags, or the output is orphaned and renders wrong.
+_DNG_COLOR_TAGS = (
+    271,    # Make
+    272,    # Model
+    50708,  # UniqueCameraModel
+    50709,  # LocalizedCameraModel
+    50721,  # ColorMatrix1
+    50722,  # ColorMatrix2
+    50723,  # CameraCalibration1
+    50724,  # CameraCalibration2
+    50725,  # ReductionMatrix1
+    50726,  # ReductionMatrix2
+    50727,  # AnalogBalance
+    50728,  # AsShotNeutral -- the capture's own white balance
+    50778,  # CalibrationIlluminant1
+    50779,  # CalibrationIlluminant2
+    50964,  # ForwardMatrix1
+    50965,  # ForwardMatrix2
+    50936,  # ProfileName
+    50941,  # ProfileEmbedPolicy
+)
+
+
+def read_dng_color_tags(path: Path) -> list:
+    """
+    Read the colour/identity tags from a DNG as tifffile `extratags` tuples.
+
+    Returned verbatim -- original TIFF type and value -- so save_dng can re-emit
+    them without reinterpreting anything. Anything unreadable is skipped rather
+    than guessed at.
+    """
+    try:
+        import tifffile
+    except ImportError:
+        return []
+    out = []
+    try:
+        with tifffile.TiffFile(str(path)) as tf:
+            tags = tf.pages[0].tags
+            for code in _DNG_COLOR_TAGS:
+                tag = tags.get(code)
+                if tag is None or tag.value is None:
+                    continue
+                value = tag.value
+                count = tag.count
+                if isinstance(value, str):
+                    out.append((code, 's', 0, value, True))
+                else:
+                    if isinstance(value, (int, float, bytes)):
+                        value = (value,) if not isinstance(value, bytes) else value
+                    out.append((code, int(tag.dtype), count, value, True))
+    except Exception:
+        return []
+    return out
+
+
 def _dng_rationals(values, denom: int = 10000):
     """Flatten floats into the (numerator, denominator) int pairs TIFF wants."""
     out = []
@@ -459,7 +521,8 @@ def save_dng(adu: np.ndarray, out: Path, pattern: np.ndarray,
              black: np.ndarray, white: float,
              color_matrix: np.ndarray | None = None,
              as_shot_neutral: np.ndarray | None = None,
-             model: str = "noise_analysis GT") -> None:
+             model: str = "noise_analysis GT",
+             copy_tags: list | None = None) -> None:
     """
     Write a Bayer frame as an uncompressed DNG.
 
@@ -470,6 +533,13 @@ def save_dng(adu: np.ndarray, out: Path, pattern: np.ndarray,
 
     CFAPattern uses DNG's colour codes (0=R, 1=G, 2=B), so rawpy's second-green
     marker (3) maps to 1; LibRaw reconstructs the G2 designation itself on read.
+
+    When copy_tags is supplied (from read_dng_color_tags on a source frame),
+    the capture's own colour and identity tags are re-emitted verbatim and the
+    synthesised colour_matrix / as_shot_neutral are not written. That is the
+    only way to get correct colour: converters look the camera up by identity
+    against their own profile database, so a file naming an unknown camera
+    renders wrong no matter what ColorMatrix1 it carries.
 
     Verified round-trip through rawpy: pixels bit-exact, and raw_pattern,
     black_level_per_channel and white_level all read back as written.
@@ -493,9 +563,7 @@ def save_dng(adu: np.ndarray, out: Path, pattern: np.ndarray,
         (33422, 'B', 4, cfa, True),                     # CFAPattern
         (50706, 'B', 4, (1, 4, 0, 0), True),            # DNGVersion 1.4.0.0
         (50707, 'B', 4, (1, 1, 0, 0), True),            # DNGBackwardVersion
-        (50708, 's', 0, model, True),                   # UniqueCameraModel
         (50717, 'I', 1, (int(round(white)),), True),    # WhiteLevel
-        (50778, 'H', 1, (21,), True),                   # CalibrationIlluminant1 = D65
     ]
     # Per-channel black levels need the repeat-dim tag; a single shared value
     # can be written on its own.
@@ -505,14 +573,26 @@ def save_dng(adu: np.ndarray, out: Path, pattern: np.ndarray,
     else:
         tags.append((50714, 'H', 1, (int(round(bl[0])),), True))
 
-    if color_matrix is not None:
-        tags.append((50721, '2i', 9, _dng_rationals(color_matrix), True))
+    copied = {t[0] for t in (copy_tags or ())}
+    if copy_tags:
+        # The capture's own colour and identity tags, verbatim.
+        tags += list(copy_tags)
     else:
-        # DNG requires ColorMatrix1; identity is the honest placeholder when the
-        # source carries no camera profile (e.g. GN3 .raw).
-        tags.append((50721, '2i', 9, _dng_rationals(np.eye(3)), True))
-    neutral = np.ones(3) if as_shot_neutral is None else np.asarray(as_shot_neutral)
-    tags.append((50728, '2i', 3, _dng_rationals(neutral), True))
+        tags.append((50708, 's', 0, model, True))   # UniqueCameraModel
+    if 50721 not in copied:
+        # DNG requires ColorMatrix1. Identity is the honest placeholder when
+        # there is no source profile to copy (e.g. GN3 .raw), and the file is
+        # then a raw data container rather than a colour-managed image.
+        tags.append((50721, '2i', 9,
+                     _dng_rationals(color_matrix if color_matrix is not None
+                                    else np.eye(3)), True))
+    if 50728 not in copied:
+        neutral = (np.ones(3) if as_shot_neutral is None
+                   else np.asarray(as_shot_neutral))
+        # AsShotNeutral is RATIONAL (unsigned), not SRATIONAL.
+        tags.append((50728, '2I', 3, _dng_rationals(neutral), True))
+    if 50778 not in copied:
+        tags.append((50778, 'H', 1, (21,), True))   # CalibrationIlluminant1 D65
 
     tifffile.imwrite(str(out), adu, photometric='CFA', planarconfig='contig',
                      compression=None, extratags=tags)

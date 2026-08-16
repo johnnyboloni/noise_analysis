@@ -67,6 +67,7 @@ from raw_utils import (
     calibrate_frame, demosaic_to_rgb, plot_sample_frames, save_rgb_png,
     highpass_std, bayer_plane_median3, progress, format_duration,
     uncalibrate_frame, save_dng, get_dng_color_matrix,
+    read_dng_color_tags,
 )
 
 
@@ -1004,7 +1005,16 @@ def analyze_gt_sequence(
     # Full-resolution saves: an RGB PNG to look at, and a DNG to feed onward.
     # The DNG carries the sequence's own black/white levels and camera profile,
     # so a GT frame drops into the same tooling as an original capture.
-    dng_ccm = get_dng_color_matrix(paths[0]) if fmt == 'dng' else None
+    # Copy the capture's own colour/identity tags rather than synthesising a
+    # profile: converters resolve colour by looking the camera up in their own
+    # database, so a DNG naming an unknown camera renders wrong however good
+    # its ColorMatrix1 is. GN3 has no source DNG, so those files stay raw data
+    # containers with an identity matrix.
+    dng_tags = read_dng_color_tags(paths[0]) if fmt == 'dng' else None
+    dng_ccm  = get_dng_color_matrix(paths[0]) if fmt == 'dng' else None
+    if fmt == 'dng':
+        print(f"  DNG colour tags copied from source: "
+              f"{len(dng_tags or [])} tag(s)")
     # AsShotNeutral is the camera-space value of a neutral patch, i.e. the
     # reciprocal of the white-balance gains that get applied to reach neutral.
     neutral = (1.0 / np.asarray(wb, dtype=float)) if wb is not None else None
@@ -1024,7 +1034,8 @@ def analyze_gt_sequence(
             save_dng(uncalibrate_frame(frame, pattern, black, white),
                      dng_path, pattern, black, white,
                      color_matrix=dng_ccm, as_shot_neutral=neutral,
-                     model=f"noise_analysis GT ({seq_name})")
+                     model=f"noise_analysis GT ({seq_name})",
+                     copy_tags=dng_tags)
 
     print("  Saving full-resolution frames …")
     save_candidate(full_mean,     seq_out / f"gt_mean_rgb_N{n}.png")

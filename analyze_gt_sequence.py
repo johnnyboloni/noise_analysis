@@ -21,14 +21,6 @@ Outputs (saved to OUTPUT_DIR):
                              gain=1 stills -- as full frames, 100% crops, and
                              difference maps against the plain mean, with their
                              residual pixel noise printed
-
-Correction order matters and is fixed: average, then subtract the dark, then
-interpolate defects. Interpolating before the subtraction removes a defect's
-large dark value from an already-repaired pixel and punches a hole (measured:
-1.98 ADU of residual error the right way round, 83.20 the wrong way). Repairing
-only the averaged frame is also sufficient -- cubic fill is linear and the mask
-is static, so repairing every frame first is bit-identical for N times the work.
-
   - gt_checkpoint_noise.png: measured noise vs frames averaged -- split-half
                              temporal noise (unbiased; the two halves share no
                              frames) alongside the high-pass residual, against
@@ -40,6 +32,13 @@ is static, so repairing every frame first is bit-identical for N times the work.
                              and FPN cancel in the subtraction)
   - gt_defect_map.png/.npy : hot/cold pixels found in the master dark
                              (only when DARK_DIR is set)
+
+Correction order matters and is fixed: average, then subtract the dark, then
+interpolate defects. Interpolating before the subtraction removes a defect's
+large dark value from an already-repaired pixel and punches a hole (measured:
+1.98 ADU of residual error the right way round, 83.20 the wrong way). Repairing
+only the averaged frame is also sufficient -- cubic fill is linear and the mask
+is static, so repairing every frame first is bit-identical for N times the work.
 
 The sequence is read exactly once; every measurement above rides that single
 streaming pass.

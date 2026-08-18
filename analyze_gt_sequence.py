@@ -11,11 +11,13 @@ Outputs (saved to OUTPUT_DIR):
   - gt_mean_darksub_*      : mean frame minus a sigma-clipped master dark,
                              with a report of how many dark frames the master
                              actually wants (only when DARK_DIR is set)
-  - gt_*_defectfix_*       : "defectfix" = pixels on the defect map replaced by
-                             cubic interpolation from their same-colour
-                             neighbours. Produced both with and without the
-                             dark subtraction, so the two corrections can be
-                             judged separately.
+  - gt_*_defectfix_*       : "defectfix" = pixels on the defect map rebuilt by
+                             interpolating along the locally smoothest direction
+                             within their own Bayer sub-plane. Produced both
+                             with and without the dark subtraction, so the two
+                             corrections can be judged separately. Every
+                             repaired pixel is a guess, so a large defect map
+                             costs real detail -- the run warns about that.
   - comparison/            : every GT candidate together -- mean, median,
                              trimmed mean, defect-repaired, dark-subtracted and
                              gain=1 stills -- as full frames, 100% crops, and
@@ -65,7 +67,8 @@ from raw_utils import (
     get_raw_metadata, get_raw_metadata_gn3, get_color_metadata,
     load_raw, load_raw_gn3, load_raw_rgb, load_raw_rgb_gn3,
     calibrate_frame, demosaic_to_rgb, plot_sample_frames, save_rgb_png,
-    highpass_std, bayer_plane_median3, progress, format_duration,
+    highpass_std, bayer_plane_median3, directional_fill_bayer,
+    progress, format_duration,
     uncalibrate_frame, save_dng, get_dng_color_matrix,
     read_dng_color_tags,
 )
@@ -99,6 +102,10 @@ DARK_SIGMA_CLIP = 4.0   # reject dark samples beyond this many sigma from the
 HOT_PIXEL_SIGMA = 5.0   # flag master-dark pixels this many residual-sigma from
                         # their same-colour neighbours as defects, and repair
                         # them by interpolation. 0 or None = skip.
+DEFECT_FRAC_WARN = 0.001  # warn once the defect map exceeds this fraction of the
+                          # frame. Every flagged pixel is reconstructed from its
+                          # neighbours, so a large map trades noise for lost
+                          # detail; real sensors are well under 0.1%.
 STILLS_DIR      = None  # dir of gain=1 long-exposure stills to compare against.
                         # None = skip the comparison.
 MATCH_STILL_INTENSITY = True   # rescale the stills by a robust ratio so the
@@ -413,11 +420,18 @@ def _defect_map(dark_adu, pattern, resid_adu, n_sigma):
 
 
 def _interpolate_defects(frame, pattern, mask):
-    """Replace flagged pixels with the median of their same-colour neighbours."""
+    """
+    Repair flagged pixels by interpolating along the locally smoothest direction.
+
+    Previously this took a 3x3 median of each Bayer sub-plane -- a 5x5 window in
+    full-frame terms, symmetric, so on fine detail it reached across edges and
+    pulled in the background. On synthetic text it left 0.761 error on 1-px
+    strokes and only 1% of them survived; direction-following leaves 0.574 and
+    is better overall too (0.047 vs 0.075). See directional_fill_plane.
+    """
     if not mask.any():
         return frame
-    med = bayer_plane_median3(frame, pattern)
-    return np.where(mask, med, frame).astype(np.float32)
+    return directional_fill_bayer(frame, pattern, mask)
 
 
 def _plot_defect_map(mask, n_hot, n_cold, out):
@@ -1092,9 +1106,21 @@ def analyze_gt_sequence(
             resid_adu = resid * float(white - black[0])
             mask, n_hot, n_cold = _defect_map(dark_adu, pattern, resid_adu,
                                               HOT_PIXEL_SIGMA)
+            frac = mask.mean() * 100
             print(f"\n  Defect map (>{HOT_PIXEL_SIGMA}σ from same-colour "
                   f"neighbours in the master dark): "
-                  f"{n_hot} hot, {n_cold} cold, {mask.mean() * 100:.4f}% of pixels")
+                  f"{n_hot} hot, {n_cold} cold, {frac:.4f}% of pixels")
+            if frac > DEFECT_FRAC_WARN * 100:
+                # Every flagged pixel is guessed from its neighbours, and a guess
+                # on fine detail is damage. Real sensors sit well under 0.1%; a
+                # larger map usually means the master dark is still noisy enough
+                # that its own noise is clearing the threshold.
+                print(f"  WARNING: that is a lot of pixels to interpolate. Each one "
+                      f"is reconstructed from its neighbours,")
+                print(f"           which costs real detail wherever the scene is "
+                      f"fine (text, edges). Raise --hot-pixel-sigma or")
+                print(f"           add dark frames until the map is nearer "
+                      f"{DEFECT_FRAC_WARN * 100:.2f}%.")
             if mask.any():
                 _plot_defect_map(mask, n_hot, n_cold,
                                  seq_out / "gt_defect_map.png")

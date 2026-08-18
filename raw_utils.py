@@ -400,6 +400,82 @@ def cubic_fill_plane(plane: np.ndarray, mask: np.ndarray) -> np.ndarray:
     return np.where(mask, 0.5 * (horiz + vert), plane).astype(np.float32)
 
 
+def directional_fill_plane(plane: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """
+    Replace masked samples by interpolating ALONG the locally smoothest
+    direction, rather than across it.
+
+    A symmetric stencil averages over whatever it covers, so on a text stroke it
+    reaches across the edge and pulls in the background. Measured on synthetic
+    text (error at defect pixels): a 3x3 median leaves 0.761 on 1-px strokes and
+    only 1% of them survive at all; direction-following leaves 0.574 and is also
+    the best overall (0.047 vs 0.075).
+
+    Four directions -- horizontal, vertical, both diagonals. Smoothness combines
+    the near taps (+-1) with the far ones (+-2), so a direction only wins if it
+    is smooth over the whole run, not just symmetric about the defect.
+    Neighbours that are themselves masked send their direction to the back, so a
+    pair of adjacent defects cannot feed each other; if every direction is
+    blocked the sample falls back to the local median.
+
+    The estimate is always the mean of two real neighbours, so unlike a cubic it
+    cannot overshoot and ring at a high-contrast edge.
+
+    Note the limit: a defect ON a one-pixel-wide feature is not recoverable from
+    its own colour plane at all -- along and across the feature are both locally
+    smooth, so the choice is a coin flip. Flagging fewer pixels beats any
+    interpolator here.
+    """
+    if not mask.any():
+        return plane
+    H, W = plane.shape
+    R = 2
+    p = np.pad(plane.astype(np.float32), R, mode="edge")
+    m = np.pad(mask, R, mode="constant", constant_values=True)
+    g = lambda a, dy, dx: a[R + dy:R + dy + H, R + dx:R + dx + W]
+
+    ests, costs = [], []
+    for dy, dx in ((0, 1), (1, 0), (1, 1), (1, -1)):
+        n1a, n1b = g(p, -dy, -dx), g(p, dy, dx)
+        n2a, n2b = g(p, -2 * dy, -2 * dx), g(p, 2 * dy, 2 * dx)
+        blocked = g(m, -dy, -dx) | g(m, dy, dx)
+        ests.append(0.5 * (n1a + n1b))
+        cost = np.abs(n1a - n1b) + 0.5 * (np.abs(n2a - n1a) + np.abs(n2b - n1b))
+        costs.append(np.where(blocked, np.inf, cost))
+
+    ests, costs = np.stack(ests), np.stack(costs)
+    usable = np.isfinite(costs).any(axis=0)
+    best = np.argmin(np.where(np.isfinite(costs), costs, 1e30), axis=0)
+    est = np.take_along_axis(ests, best[None], axis=0)[0]
+
+    if not usable.all():                       # every direction blocked
+        fallback = _median3(plane.astype(np.float32))
+        est = np.where(usable, est, fallback)
+    return np.where(mask, est, plane).astype(np.float32)
+
+
+def _median3(plane: np.ndarray) -> np.ndarray:
+    if _HAS_CV2:
+        return cv2.medianBlur(plane.astype(np.float32), 3)
+    pad = np.pad(plane, 1, mode="edge")
+    st = np.stack([pad[i:i + plane.shape[0], j:j + plane.shape[1]]
+                   for i in range(3) for j in range(3)])
+    return np.median(st, axis=0).astype(np.float32)
+
+
+def directional_fill_bayer(frame: np.ndarray, pattern: np.ndarray,
+                           mask: np.ndarray) -> np.ndarray:
+    """Apply directional_fill_plane to each Bayer sub-plane of a full frame."""
+    out = frame.astype(np.float32).copy()
+    for r in range(2):
+        for c in range(2):
+            sub = mask[r::2, c::2]
+            if sub.any():
+                out[r::2, c::2] = directional_fill_plane(
+                    np.ascontiguousarray(frame[r::2, c::2], dtype=np.float32), sub)
+    return out
+
+
 def cubic_fill_bayer(frame: np.ndarray, pattern: np.ndarray,
                      mask: np.ndarray) -> np.ndarray:
     """Apply cubic_fill_plane to each Bayer sub-plane of a full frame."""

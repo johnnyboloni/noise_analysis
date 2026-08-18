@@ -4,7 +4,12 @@ GT frame aggregation analysis for a static lowlight sequence.
 Edit the CONFIG block below, then run:
     python analyze_gt_sequence.py
 
-Outputs (saved to OUTPUT_DIR):
+Outputs (saved to OUTPUT_DIR/<sequence_name><RUN_SUFFIX>/):
+  - run_info.json          : what produced this directory -- UTC timestamp, git
+                             commit/branch/subject and whether the working tree
+                             was dirty, plus the entire CONFIG block. A results
+                             directory that cannot be traced back to a code
+                             state and a set of settings is guesswork later.
   - gt_sample_frames.png   : evenly-spaced sample frames (RGB)
   - gt_aggregated.png      : mean / median / trimmed-mean side-by-side (RGB)
   - gt_differences.png     : (mean−median), (mean−trimmed), (median−trimmed) heatmaps
@@ -55,6 +60,7 @@ import argparse
 import json
 import time
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -69,7 +75,7 @@ from raw_utils import (
     calibrate_frame, demosaic_to_rgb, plot_sample_frames, save_rgb_png,
     highpass_std, bayer_plane_median3, directional_fill_bayer,
     progress, format_duration,
-    uncalibrate_frame, save_dng, get_dng_color_matrix,
+    uncalibrate_frame, save_dng, get_dng_color_matrix, git_revision,
     read_dng_color_tags,
 )
 
@@ -79,6 +85,11 @@ from raw_utils import (
 # ============================================================
 SEQUENCE_DIR  = "/path/to/static/sequence"
 OUTPUT_DIR    = "output/gt_analysis"
+RUN_SUFFIX    = "_better_interp"   # appended to the per-sequence output dir, to
+                                   # label what this run is testing. Keeps runs
+                                   # side by side instead of overwriting each
+                                   # other; run_info.json inside records the
+                                   # commit and full config that produced them.
 GN3_BLACK_LEVEL = 256    # uniform black level for GN3 .raw files
 
 MAX_FRAMES    = None  # int to cap total frames loaded, None = all
@@ -922,8 +933,14 @@ def analyze_gt_sequence(
     Saves outputs to out_dir/<sequence_name>/ (see module docstring).
     """
     seq_name = Path(directory).name
-    seq_out  = out_dir / seq_name
+    seq_out  = out_dir / (seq_name + (RUN_SUFFIX or ""))
     seq_out.mkdir(parents=True, exist_ok=True)
+
+    rev = git_revision()
+    if rev:
+        print(f"  Code: {rev['short']} on {rev['branch']}"
+              + ("  (WORKING TREE DIRTY)" if rev['dirty'] else "")
+              + f"  — {rev['subject']}")
 
     fmt, paths, pattern, black, white, loader, sample_fn = _make_loaders(directory)
     if max_frames is not None:
@@ -1216,12 +1233,44 @@ def analyze_gt_sequence(
             print(f"    {lab:<{width}s} {hp:.6f}   {base / hp:5.2f}x vs mean")
         print()
 
+    _write_run_info(seq_out, directory, fmt, n, n_stack, rev)
     print(f"\nDone. Outputs in {seq_out.resolve()}")
 
 
 # --------------------------------------------------------------------------- #
 # CLI overrides + entry point                                                   #
 # --------------------------------------------------------------------------- #
+
+def _write_run_info(seq_out, directory, fmt, n, n_stack, rev):
+    """
+    Record what produced these outputs, next to the outputs themselves.
+
+    A results directory that cannot be traced back to a code state and a set of
+    settings is guesswork a week later, and this pipeline has enough knobs that
+    "which run was that?" is a real question. The whole CONFIG block is captured
+    rather than a chosen subset, so nothing silently goes unrecorded when a new
+    option is added.
+    """
+    g = globals()
+    scalar = (bool, int, float, str, type(None))
+    config = {k: g[k] for k in sorted(g)
+              if k.isupper() and not k.startswith('_') and isinstance(g[k], scalar)}
+    info = {
+        "run": {
+            "utc":       datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "script":    Path(__file__).name,
+            "sequence":  str(Path(directory).resolve()),
+            "format":    fmt,
+            "frames":    n,
+            "stack":     n_stack,
+        },
+        "code": rev or {"note": "git unavailable — provenance not recorded"},
+        "config": config,
+    }
+    out = seq_out / "run_info.json"
+    out.write_text(json.dumps(info, indent=2, sort_keys=False))
+    print(f"Saved {out}")
+
 
 def _none_or_auto(s: str):
     """argparse type for config values that can be None or a scalar."""

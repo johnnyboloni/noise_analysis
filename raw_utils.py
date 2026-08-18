@@ -33,6 +33,37 @@ def progress(iterable, desc: str = "", total: int | None = None):
     return iterable
 
 
+def git_revision(repo_dir=None) -> dict:
+    """
+    Describe the working tree that is producing this run.
+
+    The `dirty` flag matters as much as the hash: a commit id alone is
+    misleading when there are uncommitted edits, which is the normal state
+    while iterating. Returns {} rather than raising when git is unavailable or
+    this is not a checkout -- provenance is nice to have, not a reason to fail
+    an analysis.
+    """
+    import subprocess
+    repo = Path(repo_dir) if repo_dir else Path(__file__).resolve().parent
+    def run(*args):
+        return subprocess.run(["git", "-C", str(repo), *args],
+                              capture_output=True, text=True, timeout=10)
+    try:
+        head = run("rev-parse", "HEAD")
+        if head.returncode != 0:
+            return {}
+        commit = head.stdout.strip()
+        return {
+            "commit":  commit,
+            "short":   commit[:12],
+            "branch":  run("rev-parse", "--abbrev-ref", "HEAD").stdout.strip(),
+            "subject": run("log", "-1", "--pretty=%s").stdout.strip(),
+            "dirty":   bool(run("status", "--porcelain").stdout.strip()),
+        }
+    except Exception:
+        return {}
+
+
 def format_duration(seconds: float) -> str:
     """Human-readable elapsed time, e.g. '1h 04m 12s', '3m 07s', '12.4s'."""
     if seconds < 60:

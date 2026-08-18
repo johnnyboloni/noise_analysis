@@ -33,6 +33,51 @@ def progress(iterable, desc: str = "", total: int | None = None):
     return iterable
 
 
+def prefetch(paths, loader, workers: int = 1, depth: int | None = None):
+    """
+    Yield (path, loaded_frame) IN ORDER, decoding up to `depth` frames ahead.
+
+    Order is not a convenience here, it is a correctness requirement: the
+    split-half noise estimate depends on even/odd frame indices, the
+    stationarity check on first/second half, and checkpoints fire at particular
+    frame counts. Any out-of-order accumulation would silently corrupt all
+    three, so this keeps a sliding window of futures and consumes them in
+    submission order rather than as they complete.
+
+    Threads rather than processes: rawpy releases the GIL around LibRaw's
+    decode (`with nogil` in unpack), and the GN3 path is file I/O plus numpy,
+    which also releases it -- so threads get real parallelism here, while
+    processes would have to pickle ~50 MB arrays back per frame.
+
+    `depth` bounds memory: at most that many decoded frames are in flight, so
+    peak cost is depth x frame size on top of the accumulators. Defaults to
+    workers + 2, enough to keep every worker fed without hoarding.
+    """
+    if workers is None or workers <= 1:
+        for p in paths:
+            yield p, loader(p)
+        return
+
+    from collections import deque
+    from concurrent.futures import ThreadPoolExecutor
+
+    depth = depth or (workers + 2)
+    it = iter(paths)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        window = deque()
+        for _ in range(depth):
+            nxt = next(it, None)
+            if nxt is None:
+                break
+            window.append((nxt, pool.submit(loader, nxt)))
+        while window:
+            path, fut = window.popleft()
+            yield path, fut.result()
+            nxt = next(it, None)
+            if nxt is not None:
+                window.append((nxt, pool.submit(loader, nxt)))
+
+
 def git_revision(repo_dir=None) -> dict:
     """
     Describe the working tree that is producing this run.

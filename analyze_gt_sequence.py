@@ -74,7 +74,7 @@ from raw_utils import (
     load_raw, load_raw_gn3, load_raw_rgb, load_raw_rgb_gn3,
     calibrate_frame, demosaic_to_rgb, plot_sample_frames, save_rgb_png,
     highpass_std, bayer_plane_median3, directional_fill_bayer,
-    progress, format_duration,
+    progress, prefetch, format_duration,
     uncalibrate_frame, save_dng, get_dng_color_matrix, git_revision,
     read_dng_color_tags,
 )
@@ -119,6 +119,13 @@ DARK_SIGMA_CLIP = 4.0   # reject dark samples beyond this many sigma from the
 HOT_PIXEL_SIGMA = 5.0   # flag master-dark pixels this many residual-sigma from
                         # their same-colour neighbours as defects, and repair
                         # them by interpolation. 0 or None = skip.
+LOAD_WORKERS    = 4     # threads used to decode frames ahead of the accumulator.
+                        # rawpy releases the GIL around LibRaw's decode, so
+                        # threads give real parallelism here (measured ~3x at 4
+                        # workers); more than the core count regresses. Frames
+                        # are still consumed strictly in order -- the split-half,
+                        # stationarity and checkpoint logic all depend on frame
+                        # index. Costs about (workers + 2) frames of memory.
 DEFECT_FILL     = "median"  # how repaired pixels are rebuilt: "median" (3x3
                             # per Bayer sub-plane, quieter, better on the smooth
                             # content a lowlight GT is mostly made of) or
@@ -218,9 +225,10 @@ def _stream_mean(paths, pattern, black, white, loader,
     half    = n // 2
     frame_levels = []
 
-    for i, p in enumerate(progress(paths, desc="  mean")):
+    for i, (p, frame) in enumerate(progress(
+            prefetch(paths, loader, LOAD_WORKERS), desc="  mean", total=n)):
         idx = i + 1
-        raw = loader(p).astype(np.float64)
+        raw = frame.astype(np.float64)
         if i % 2 == 0:
             acc_e = raw if acc_e is None else acc_e + raw
             n_e += 1
@@ -320,8 +328,10 @@ def _dark_master(paths, n_use, loader, sigma_clip=4.0):
     n = min(n_use, len(paths)) if n_use else len(paths)
 
     mean = M2 = None
-    for i in progress(range(n), desc="  dark mean/std", total=n):
-        x = loader(paths[i]).astype(np.float64)
+    for i, (_p, frame) in enumerate(progress(
+            prefetch(paths[:n], loader, LOAD_WORKERS),
+            desc="  dark mean/std", total=n)):
+        x = frame.astype(np.float64)
         if mean is None:
             mean, M2 = x.copy(), np.zeros_like(x)
         else:
@@ -340,8 +350,9 @@ def _dark_master(paths, n_use, loader, sigma_clip=4.0):
 
     s = np.zeros(lo.shape, dtype=np.float64)
     c = np.zeros(lo.shape, dtype=np.int32)
-    for i in progress(range(n), desc="  dark clip", total=n):
-        x = loader(paths[i]).astype(np.float32)
+    for _p, frame in progress(prefetch(paths[:n], loader, LOAD_WORKERS),
+                              desc="  dark clip", total=n):
+        x = frame.astype(np.float32)
         m = (x >= lo) & (x <= hi)
         s += np.where(m, x, 0.0)
         c += m
@@ -528,8 +539,10 @@ def _compute_median_and_trimmed(paths, n_stack, pattern, black, white, loader,
                                    dtype=np.float32, shape=(n, H, W))
     mm[0] = first
     del first
-    for i in progress(range(1, n), desc="  stack", total=n - 1):
-        mm[i] = calibrate_frame(loader(paths[i]), pattern, black, white)
+    for i, (_p, frame) in enumerate(progress(
+            prefetch(paths[1:n], loader, LOAD_WORKERS),
+            desc="  stack", total=n - 1), start=1):
+        mm[i] = calibrate_frame(frame, pattern, black, white)
     mm.flush()
     print()
 
@@ -622,8 +635,9 @@ def _stills_reference(directory, shape, match_to=None):
     fmt, paths, pattern, black, white, loader, _ = _make_loaders(directory)
     accum = None
     n = len(paths)
-    for p in progress(paths, desc="  stills"):
-        raw   = loader(p).astype(np.float64)
+    for _p, frame in progress(prefetch(paths, loader, LOAD_WORKERS),
+                              desc="  stills", total=n):
+        raw   = frame.astype(np.float64)
         accum = raw if accum is None else accum + raw
     print()
 
@@ -963,7 +977,10 @@ def analyze_gt_sequence(
     Saves outputs to out_dir/<sequence_name>/ (see module docstring).
     """
     seq_name = Path(directory).name
-    seq_out  = out_dir / (seq_name + (RUN_SUFFIX or ""))
+    # A capped run is a different experiment from a full one, so it gets its own
+    # directory rather than silently overwriting the full result.
+    cap      = f"_max{max_frames}" if max_frames else ""
+    seq_out  = out_dir / (seq_name + (RUN_SUFFIX or "") + cap)
     seq_out.mkdir(parents=True, exist_ok=True)
 
     rev = git_revision()

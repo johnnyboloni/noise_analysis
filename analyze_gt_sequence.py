@@ -85,11 +85,17 @@ from raw_utils import (
 # ============================================================
 SEQUENCE_DIR  = "/path/to/static/sequence"
 OUTPUT_DIR    = "output/gt_analysis"
-RUN_SUFFIX    = "_better_interp"   # appended to the per-sequence output dir, to
-                                   # label what this run is testing. Keeps runs
-                                   # side by side instead of overwriting each
-                                   # other; run_info.json inside records the
-                                   # commit and full config that produced them.
+RUN_SUFFIX    = "_better_interp"   # appended to the per-sequence output dir, so
+                                   # runs sit side by side instead of
+                                   # overwriting each other and the directory
+                                   # name says what was being tested.
+                                   #
+                                   # Maintained at commit time, not by hand:
+                                   # any commit that changes what the outputs
+                                   # look like updates this slug too. See
+                                   # CLAUDE.md. run_info.json in each output
+                                   # directory holds the precise record (commit,
+                                   # branch, dirty flag, full config).
 GN3_BLACK_LEVEL = 256    # uniform black level for GN3 .raw files
 
 MAX_FRAMES    = None  # int to cap total frames loaded, None = all

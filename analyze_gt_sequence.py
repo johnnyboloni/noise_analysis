@@ -85,7 +85,7 @@ from raw_utils import (
 # ============================================================
 SEQUENCE_DIR  = "/path/to/static/sequence"
 OUTPUT_DIR    = "output/gt_analysis"
-RUN_SUFFIX    = "_defect_thresh_fix"   # appended to the per-sequence output dir, so
+RUN_SUFFIX    = "_single_still"   # appended to the per-sequence output dir, so
                                    # runs sit side by side instead of
                                    # overwriting each other and the directory
                                    # name says what was being tested.
@@ -140,6 +140,10 @@ DEFECT_FRAC_WARN = 0.005  # warn once the defect map exceeds this fraction of th
                           # map.
 STILLS_DIR      = None  # dir of gain=1 long-exposure stills to compare against.
                         # None = skip the comparison.
+STILLS_FRAMES   = 1     # how many stills to use. 1 (default) keeps this an
+                        # independent single-shot reference against the averaged
+                        # GT; averaging more would make it another aggregate and
+                        # blur anything that moved between shots.
 MATCH_STILL_INTENSITY = True   # rescale the stills by a robust ratio so the
                                # comparison is not dominated by an exposure
                                # mismatch between the two capture settings
@@ -651,11 +655,18 @@ def _plot_halfdiff_crops(crops, out, crop_size, vmax):
 
 def _stills_reference(directory, shape, match_to=None):
     """
-    Mean of a directory of stills, calibrated with the stills' OWN metadata.
+    Reference frame from the gain=1 stills, calibrated with the stills' OWN
+    metadata.
 
-    These are a separate capture at a different gain and exposure, so their
-    black and white levels need not match the sequence's -- calibrating them
-    with the sequence's values would apply the wrong pedestal and scale.
+    Uses STILLS_FRAMES stills (default 1, i.e. a single frame). The point of
+    this reference is to show what one clean low-gain capture looks like, as an
+    independent check on the averaged GT -- averaging several would make it a
+    second aggregate rather than the independent single-shot comparison it is
+    meant to be, and would blur anything that shifted between them.
+
+    Calibrated with the stills' own black and white levels: this is a separate
+    capture at a different gain and exposure, so using the sequence's values
+    would apply the wrong pedestal and scale.
 
     If match_to is given, the result is rescaled by the ratio of medians so an
     exposure mismatch between the two capture settings does not dominate every
@@ -663,13 +674,16 @@ def _stills_reference(directory, shape, match_to=None):
     near-black pixels give an unstable ratio.
     """
     fmt, paths, pattern, black, white, loader, _ = _make_loaders(directory)
-    accum = None
-    n = len(paths)
-    for _p, frame in progress(prefetch(paths, loader, LOAD_WORKERS),
-                              desc="  stills", total=n):
-        raw   = frame.astype(np.float64)
-        accum = raw if accum is None else accum + raw
-    print()
+    n = max(1, min(int(STILLS_FRAMES or 1), len(paths)))
+    if n == 1:
+        accum = loader(paths[0]).astype(np.float64)
+    else:
+        accum = None
+        for _p, frame in progress(prefetch(paths[:n], loader, LOAD_WORKERS),
+                                  desc="  stills", total=n):
+            raw   = frame.astype(np.float64)
+            accum = raw if accum is None else accum + raw
+        print()
 
     cal = calibrate_frame((accum / n).astype(np.float32), pattern, black, white)
     if cal.shape != shape:
@@ -1274,10 +1288,10 @@ def analyze_gt_sequence(
         still, n_still, scale = _stills_reference(
             STILLS_DIR, full_mean.shape,
             match_to=full_mean if MATCH_STILL_INTENSITY else None)
-        print(f"  {n_still} stills averaged"
+        print(f"  {n_still} still{'s averaged' if n_still > 1 else ''}"
               + (f", intensity-matched by ×{scale:.4f}" if MATCH_STILL_INTENSITY
                  else ", no intensity matching"))
-        cands.append((still, f"Gain=1 stills  (N={n_still})", "stills_gain1"))
+        cands.append((still, f"Gain=1 still  (N={n_still})", "still_gain1"))
 
     if len(cands) > 1:
         cmp_dir = seq_out / "comparison"

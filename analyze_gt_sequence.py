@@ -486,6 +486,72 @@ def _defect_map(dark_adu, pattern, resid_adu, n_sigma):
     return (hot | cold), int(hot.sum()), int(cold.sum())
 
 
+def _defect_sigma_scan(dark_adu, pattern, out, current_sigma):
+    """
+    Show where real defects start, so HOT_PIXEL_SIGMA can be chosen from data.
+
+    Because the threshold is now MAD-derived, k maps directly onto a
+    false-positive rate: on a Gaussian bulk, |dev| > k sigma happens to
+    erfc(k/sqrt(2)) of healthy pixels by chance. On 12.5 MP that is ~34,000
+    pixels at k=3 and about 7 at k=5, so the choice matters far more than it
+    looks.
+
+    Real defects are the EXCESS over that expectation. The table prints both,
+    so the right k is visible rather than guessed: take the smallest k where
+    the excess still dominates the chance count, since every pixel below that
+    is a healthy pixel about to be needlessly interpolated.
+
+    The histogram shows the same thing continuously -- the residual in sigma
+    units against a Gaussian reference. Where the measured tail lifts off the
+    curve is where defects begin.
+    """
+    from math import erfc, sqrt as _sqrt
+
+    dev = dark_adu - bayer_plane_median3(dark_adu, pattern)
+    z   = np.zeros_like(dev, dtype=np.float32)
+    for r in range(2):
+        for c in range(2):
+            v     = dev[r::2, c::2]
+            med   = np.median(v)
+            sigma = 1.4826 * np.median(np.abs(v - med))
+            z[r::2, c::2] = (v - med) / max(sigma, 1e-9)
+
+    npx = z.size
+    print("\n  Choosing HOT_PIXEL_SIGMA (excess over chance = likely real)")
+    print(f"    {'k':>5} {'flagged':>10} {'by chance':>11} {'excess':>10}")
+    print("    " + "-" * 38)
+    for k in (3.0, 3.5, 4.0, 4.5, 5.0, 5.5, 6.0, 7.0):
+        flagged  = int((np.abs(z) > k).sum())
+        expected = erfc(k / _sqrt(2)) * npx
+        mark = "  <- current" if abs(k - float(current_sigma)) < 1e-9 else ""
+        print(f"    {k:>5.1f} {flagged:>10,} {expected:>11,.0f} "
+              f"{max(flagged - expected, 0):>10,.0f}{mark}")
+
+    fig, ax = plt.subplots(figsize=(9, 5))
+    bins = np.linspace(-8, 12, 400)
+    ax.hist(z.ravel(), bins=bins, color="steelblue", alpha=0.85,
+            label="measured residual")
+    centres = 0.5 * (bins[1:] + bins[:-1])
+    gauss = (npx * (bins[1] - bins[0]) *
+             np.exp(-centres ** 2 / 2) / np.sqrt(2 * np.pi))
+    ax.plot(centres, gauss, "--", color="crimson", linewidth=1.6,
+            label="Gaussian (healthy pixels)")
+    ax.axvline(float(current_sigma), color="k", linewidth=1.2,
+               label=f"current k = {current_sigma}")
+    ax.set_yscale("log")
+    ax.set_ylim(0.5, None)
+    ax.set_xlabel("local residual, in robust sigma", fontsize=11)
+    ax.set_ylabel("pixels", fontsize=11)
+    ax.set_title("Where do real defects start?  Tail above the Gaussian is the "
+                 "defect population", fontsize=12)
+    ax.legend(fontsize=9)
+    ax.grid(True, alpha=0.3, linestyle="--")
+    fig.tight_layout()
+    fig.savefig(out, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved {out}")
+
+
 def _interpolate_defects(frame, pattern, mask):
     """
     Repair flagged pixels from their same-colour neighbours.
@@ -1229,6 +1295,9 @@ def analyze_gt_sequence(
                       f"fine (text, edges). Raise --hot-pixel-sigma or")
                 print(f"           add dark frames until the map is nearer "
                       f"{DEFECT_FRAC_WARN * 100:.2f}%.")
+            _defect_sigma_scan(dark_adu, pattern,
+                               seq_out / "gt_defect_sigma_scan.png",
+                               HOT_PIXEL_SIGMA)
             if mask.any():
                 _plot_defect_map(mask, n_hot, n_cold,
                                  seq_out / "gt_defect_map.png")

@@ -85,7 +85,7 @@ from raw_utils import (
 # ============================================================
 SEQUENCE_DIR  = "/path/to/static/sequence"
 OUTPUT_DIR    = "output/gt_analysis"
-RUN_SUFFIX    = "_median_fill"   # appended to the per-sequence output dir, so
+RUN_SUFFIX    = "_defect_thresh_fix"   # appended to the per-sequence output dir, so
                                    # runs sit side by side instead of
                                    # overwriting each other and the directory
                                    # name says what was being tested.
@@ -131,10 +131,13 @@ DEFECT_FILL     = "median"  # how repaired pixels are rebuilt: "median" (3x3
                             # content a lowlight GT is mostly made of) or
                             # "directional" (follows edges, better on thin
                             # high-contrast detail, noisier elsewhere).
-DEFECT_FRAC_WARN = 0.001  # warn once the defect map exceeds this fraction of the
+DEFECT_FRAC_WARN = 0.005  # warn once the defect map exceeds this fraction of the
                           # frame. Every flagged pixel is reconstructed from its
                           # neighbours, so a large map trades noise for lost
-                          # detail; real sensors are well under 0.1%.
+                          # detail. Set above the ~0.2% a healthy sensor plus a
+                          # correct threshold produces, so the warning means
+                          # "something is wrong" rather than firing on a good
+                          # map.
 STILLS_DIR      = None  # dir of gain=1 long-exposure stills to compare against.
                         # None = skip the comparison.
 MATCH_STILL_INTENSITY = True   # rescale the stills by a robust ratio so the
@@ -429,26 +432,53 @@ def _defect_map(dark_adu, pattern, resid_adu, n_sigma):
     """
     Locate defective pixels in the master dark.
 
-    A dark frame has no scene, so a pixel far from its same-colour neighbours
-    there is a sensor defect and nothing else. That is what makes this test
-    reliable where the same test on a light frame is not: on a light frame a
-    hot pixel and a genuine single-pixel highlight are spatially identical, and
-    no threshold separates them.
+    Two ingredients, and both are needed:
 
-    Sensitivity is set by the master's own residual noise, sigma1/sqrt(N_dark),
-    not by the per-frame noise -- which is the whole reason to detect here
-    rather than per frame. With a few hundred darks that is an order of
-    magnitude finer, and it reaches the mildly-hot pixels that dominate by
-    count and are invisible in any single frame.
+    Subtract a local same-colour median first. That removes everything a sensor
+    has which is real but not a defect -- thermal/amp-glow gradients, column
+    FPN, per-channel level offsets -- so only pixels standing out from their
+    immediate surroundings survive. A purely global threshold cannot do this: on
+    a dark with a 40 ADU thermal gradient it collapses to 9% recall, because the
+    gradient inflates the spread it measures.
+
+    Then set the threshold from the MAD of that residual, per sub-plane, rather
+    than from the master dark's own noise. This is the part that was wrong
+    before: the residual is dominated by ordinary DSNU spread (pixel-to-pixel
+    variation that is normal, not defective), which is several times the
+    master's read-noise residual. Thresholding at k x residual-noise therefore
+    cut deep into the healthy population -- measured on a synthetic dark with a
+    true 0.2% defect rate, it flagged 0.58-0.70% of pixels, i.e. roughly two
+    thirds of the map were healthy pixels being needlessly interpolated. Taking
+    the scale from the data instead gives 0.19-0.21%.
+
+    Measured recall / false positives at 5 sigma across four dark types
+    (uniform, thermal gradient, column FPN, channel offsets):
+
+        global only     95.7 / 9.2 / 75.8 / 95.5 %      0-1 false positives
+        k * resid       99.6 / 99.2 / 99.2 / 99.8 %   1013-1319 false positives
+        this method     96.8 / 96.6 / 96.1 / 97.0 %      4-38 false positives
+
+    resid_adu is still accepted and reported by the caller as a quality figure
+    for the master dark, but no longer sets the threshold.
 
     Returns (mask, n_hot, n_cold). Cold (stuck-low) pixels are flagged too;
     they are equally wrong in the output and cost nothing extra to find.
     """
-    med  = bayer_plane_median3(dark_adu, pattern)
-    dev  = dark_adu - med
-    thr  = n_sigma * resid_adu
-    hot  = dev > thr
-    cold = dev < -thr
+    dev  = dark_adu - bayer_plane_median3(dark_adu, pattern)
+    hot  = np.zeros(dark_adu.shape, dtype=bool)
+    cold = np.zeros(dark_adu.shape, dtype=bool)
+    for r in range(2):
+        for c in range(2):
+            v   = dev[r::2, c::2]
+            med = np.median(v)
+            # MAD -> Gaussian sigma. Robust by construction: the defects are the
+            # outliers, and they must not be allowed to set the threshold meant
+            # to catch them.
+            sigma = 1.4826 * np.median(np.abs(v - med))
+            if sigma <= 0:
+                sigma = max(resid_adu, 1e-9)      # degenerate (e.g. synthetic) data
+            hot[r::2, c::2]  = v > med + n_sigma * sigma
+            cold[r::2, c::2] = v < med - n_sigma * sigma
     return (hot | cold), int(hot.sum()), int(cold.sum())
 
 

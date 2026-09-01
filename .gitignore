@@ -1,5 +1,7 @@
+.idea/
 __pycache__/
 *.pyc
 *.pyo
 cache/
 output/
+.DS_STORE

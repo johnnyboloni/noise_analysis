@@ -245,7 +245,7 @@ def decode_one(mcraw: Path, out_dir: Path, expected_frames: int | None = None) -
 
     cmd = [DECODER_BIN, str(mcraw), "-o", str(out_dir)]
     if NUM_FRAMES is not None:
-        cmd += ["--num-frames", str(NUM_FRAMES)]
+        cmd += ["-n", str(NUM_FRAMES)]
 
     stop_evt = watcher = None
     if expected_frames and _HAS_TQDM:
@@ -255,26 +255,16 @@ def decode_one(mcraw: Path, out_dir: Path, expected_frames: int | None = None) -
                                     daemon=True)
         watcher.start()
     try:
-        result = subprocess.run(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
+        result = subprocess.run(cmd, text=True)
     finally:
         if stop_evt is not None:
             stop_evt.set()
             watcher.join(timeout=2.0)
 
-    if result.stderr.strip():
-        for line in result.stderr.strip().splitlines():
-            _write(f"    [stderr] {line}")
-
     if result.returncode != 0:
         raise RuntimeError(
             f"Decoder exited with code {result.returncode}\n"
-            f"  cmd : {' '.join(cmd)}\n"
-            f"  stderr: {result.stderr.strip()}"
+            f"  cmd : {' '.join(cmd)}"
         )
 
     dng_count = len(list(out_dir.glob("*.dng"))) + len(list(out_dir.glob("*.DNG")))

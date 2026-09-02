@@ -34,7 +34,7 @@ from raw_utils import (
     find_dngs, find_raws,
     get_raw_metadata, get_raw_metadata_gn3, get_color_metadata,
     load_raw, load_raw_gn3, load_raw_rgb, load_raw_rgb_gn3,
-    calibrate_frame, demosaic_to_rgb,
+    calibrate_frame, demosaic_linear, encode_rgb, uniform_gain,
     plot_sample_frames,
 )
 
@@ -727,7 +727,8 @@ def _plot_group(results: list[dict], group_label: str, out_dir: Path):
 
     plot_sample_frames(sample_rgbs, labels, group_dir / "sample_frames.png")
 
-    mean_rgb = [demosaic_to_rgb(m, p, wb, ccm)
+    mean_rgb = [encode_rgb(_l := demosaic_linear(m, p, wb, ccm),
+                           gain=uniform_gain([_l]))
                 for m, p, wb, ccm in zip(means, patterns, wbs, ccms)]
     plot_mean_and_variance_frames(mean_rgb, var_frames, labels,
                                   group_dir / "mean_and_variance_frames.png")

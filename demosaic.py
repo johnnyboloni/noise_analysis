@@ -29,7 +29,8 @@ from tqdm import tqdm
 
 from raw_utils import (
     find_dngs, get_raw_metadata, get_color_metadata,
-    load_raw, calibrate_frame, demosaic_to_rgb, save_rgb_png,
+    load_raw, calibrate_frame, demosaic_linear, encode_rgb, uniform_gain,
+    save_rgb_png,
 )
 
 
@@ -46,7 +47,8 @@ def demosaic_path(path: Path, pattern: np.ndarray, black: np.ndarray,
     """
     bayer = load_raw(path)
     cal   = calibrate_frame(bayer, pattern, black, white)
-    return demosaic_to_rgb(cal, pattern, wb=wb, ccm=ccm)
+    lin = demosaic_linear(cal, pattern, wb=wb, ccm=ccm)
+    return encode_rgb(lin, gain=uniform_gain([lin]))
 
 
 def demosaic_adu_frame(frame_adu: np.ndarray, pattern: np.ndarray,
@@ -58,7 +60,8 @@ def demosaic_adu_frame(frame_adu: np.ndarray, pattern: np.ndarray,
     through the same pipeline as demosaic_path, so the two are comparable.
     """
     cal = calibrate_frame(frame_adu.astype(np.float32), pattern, black, white)
-    return demosaic_to_rgb(cal, pattern, wb=wb, ccm=ccm)
+    lin = demosaic_linear(cal, pattern, wb=wb, ccm=ccm)
+    return encode_rgb(lin, gain=uniform_gain([lin]))
 
 
 # --------------------------------------------------------------------------- #

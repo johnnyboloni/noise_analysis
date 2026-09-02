@@ -13,9 +13,13 @@ Outputs (saved to OUTPUT_DIR/<sequence_name><RUN_SUFFIX>/):
   - comparison/            : every GT candidate -- mean, defect-repaired,
                              dark-subtracted, the gain=1 still, and (with
                              ROBUST_AGGREGATORS) median and trimmed mean --
-                             each written full-resolution as .png (to
-                             look at), .npy and .dng (to feed onward), with
-                             their residual pixel noise printed. This is the
+                             each written full-resolution as .npy and .dng (to
+                             feed onward) plus two PNGs to look at: _nogain
+                             (gain 1.0, the scene as calibrated) and _uniform
+                             (one gain shared across every candidate, the
+                             largest that clips nothing anywhere in the set).
+                             Both are gamma-encoded; neither is
+                             auto-brightened. Residual pixel noise is printed. This is the
                              only place frame data is written; there are no
                              duplicate copies at the top level.
   - gt_checkpoint_noise.png: measured noise vs frames averaged -- split-half
@@ -72,7 +76,7 @@ from raw_utils import (
     detect_format, find_dngs, find_raws,
     get_raw_metadata, get_raw_metadata_gn3, get_color_metadata,
     load_raw, load_raw_gn3,
-    calibrate_frame, demosaic_to_rgb, save_rgb_png,
+    calibrate_frame, demosaic_linear, encode_rgb, uniform_gain, save_rgb_png,
     highpass_std, bayer_plane_median3, directional_fill_bayer,
     progress, prefetch, format_duration,
     uncalibrate_frame, save_dng, get_dng_color_matrix, git_revision,
@@ -85,7 +89,7 @@ from raw_utils import (
 # ============================================================
 SEQUENCE_DIR  = "/path/to/static/sequence"
 OUTPUT_DIR    = "output/gt_analysis"
-RUN_SUFFIX    = "_menon_demosaic"   # appended to the per-sequence output dir, so
+RUN_SUFFIX    = "_uniform_gain_png"   # appended to the per-sequence output dir, so
                                    # runs sit side by side instead of
                                    # overwriting each other and the directory
                                    # name says what was being tested.
@@ -155,7 +159,7 @@ DEMOSAIC        = "menon"   # demosaic used for the PNG previews and comparison
                             # colour than the "ea" this used before, at ~27 s and
                             # ~2.5 GB per 12 MP frame; "malvar" is the cheap
                             # middle ground (~9 s), "ea" the old fast default.
-                            # See raw_utils.demosaic_to_rgb for the numbers.
+                            # See raw_utils.demosaic_linear for the numbers.
 DEFECT_FRAC_WARN = 0.005  # warn once the defect map exceeds this fraction of the
                           # frame. Every flagged pixel is reconstructed from its
                           # neighbours, so a large map trades noise for lost
@@ -697,12 +701,6 @@ def _compute_median_and_trimmed(paths, n_stack, pattern, black, white, loader,
 # Plots                                                                         #
 # --------------------------------------------------------------------------- #
 
-def _save_rgb_frame(bayer: np.ndarray, pattern: np.ndarray, out: Path,
-                    wb: np.ndarray | None = None, ccm: np.ndarray | None = None) -> None:
-    """Demosaic a calibrated Bayer frame and save it as a full-resolution RGB PNG."""
-    rgb = demosaic_to_rgb(bayer, pattern, wb, ccm)
-    save_rgb_png(rgb, out)
-
 
 def _plot_halfdiff_crops(crops, out, crop_size, vmax):
     """
@@ -968,18 +966,24 @@ def _plot_checkpoint_crops(crops, out, crop_size):
     Shown at native pixel scale on purpose: any downscaling averages
     neighbouring pixels and hides exactly the per-pixel noise this plot exists
     to show, which would make every panel look equally clean regardless of N.
+
+    `crops` are scene-linear; all panels are encoded on one shared gain (the
+    largest that clips none of them) so a difference between panels is a
+    difference in the data, not in how each was exposed.
     """
     n_panels = len(crops)
+    gain = uniform_gain([c for _, c in crops])
     fig, axes = plt.subplots(1, n_panels, figsize=(4.2 * n_panels, 4.8))
     if n_panels == 1:
         axes = [axes]
     for ax, (idx, crop) in zip(axes, crops):
-        ax.imshow(crop, interpolation="nearest")
+        ax.imshow(encode_rgb(crop, gain=gain), interpolation="nearest")
         ax.set_title(f"N = {idx}", fontsize=11)
         ax.axis("off")
     fig.suptitle(
         f"Running mean vs frames averaged — {crop_size}×{crop_size} centre crop "
-        f"at 100% zoom (noise should fall as 1/√N)",
+        f"at 100% zoom, shared display gain ×{gain:.2f} "
+        f"(noise should fall as 1/√N)",
         fontsize=12, y=1.02)
     fig.tight_layout()
     fig.savefig(out, dpi=150, bbox_inches="tight")
@@ -1019,7 +1023,7 @@ def analyze_gt_sequence(
     print(f"  {n} {fmt.upper()} frames  |  white={white}  black={black[0]}")
 
     # DNG carries a real camera white-balance + color-correction profile;
-    # GN3 has none, so demosaic_to_rgb falls back to gray-world WB / no CCM.
+    # GN3 has none, so demosaic_linear falls back to gray-world WB / no CCM.
     wb, ccm = (get_color_metadata(paths[0]) if fmt == 'dng' else (None, None))
 
     # Pass 1: full streaming mean, snapshotting the running mean along the way.
@@ -1038,11 +1042,16 @@ def analyze_gt_sequence(
 
     def _on_checkpoint(idx, running, half_diff):
         # Only the crop is kept; the full-size running-mean PNGs were dropped
-        # once the convergence question was settled. The demosaic still has to
-        # run on the whole frame -- demosaicing a crop would give the crop its
-        # own auto-brighten scaling and stop the panels being comparable.
-        rgb = demosaic_to_rgb(running, pattern, wb, ccm)
-        ckpt_crops.append((idx, _crop_centre(rgb, CHECKPOINT_CROP)))
+        # once the convergence question was settled. The demosaic still runs on
+        # the whole frame -- demosaicing a crop alone changes what the
+        # interpolation sees at the crop border.
+        #
+        # The crop is stored scene-linear and encoded later, once all the
+        # checkpoints are in and they can share one display gain. Encoding each
+        # as it arrives would give the N=1 panel its own exposure and stop the
+        # panels being comparable, which is the entire point of the figure.
+        lin = demosaic_linear(running, pattern, wb, ccm)
+        ckpt_crops.append((idx, _crop_centre(lin, CHECKPOINT_CROP)))
         if half_diff is None:
             return
         # Fix the display scale from the first (noisiest) checkpoint and keep
@@ -1101,20 +1110,25 @@ def analyze_gt_sequence(
     # reciprocal of the white-balance gains that get applied to reach neutral.
     neutral = (1.0 / np.asarray(wb, dtype=float)) if wb is not None else None
 
-    def save_candidate(frame, png_path):
-        _save_rgb_frame(frame, pattern, png_path, wb, ccm)
+    def save_candidate(frame, lin_rgb, gain, base):
+        # Two PNGs per candidate, both gamma-encoded, neither auto-brightened:
+        #   _nogain  -- gain 1.0, the scene exactly as calibrated. Dark for a
+        #               lowlight capture, but it is the honest picture and the
+        #               only one whose pixel values mean something absolute.
+        #   _uniform -- one gain shared by every candidate in this run, the
+        #               largest that clips nothing anywhere in the set. Bright
+        #               enough to look at, and still comparable frame to frame:
+        #               brighter here really is brighter.
+        save_rgb_png(encode_rgb(lin_rgb),
+                     base.with_name(base.name + "_nogain.png"))
+        save_rgb_png(encode_rgb(lin_rgb, gain=gain),
+                     base.with_name(base.name + "_uniform.png"))
         if SAVE_NPY:
-            npy_path = png_path.with_name(
-                png_path.stem.replace('_rgb', '') + '.npy')
-            np.save(npy_path, frame.astype(np.float32))
-            print(f"Saved {npy_path}")
+            np.save(base.with_suffix('.npy'), frame.astype(np.float32))
+            print(f"Saved {base.with_suffix('.npy')}")
         if SAVE_DNG:
-            # Drop the "_rgb" marker from the DNG's name -- it describes the
-            # PNG's demosaiced content, not the Bayer data in the DNG.
-            dng_path = png_path.with_name(
-                png_path.stem.replace('_rgb', '') + '.dng')
             save_dng(uncalibrate_frame(frame, pattern, black, white),
-                     dng_path, pattern, black, white,
+                     base.with_suffix('.dng'), pattern, black, white,
                      color_matrix=dng_ccm, as_shot_neutral=neutral,
                      model=f"noise_analysis GT ({seq_name})",
                      copy_tags=dng_tags)
@@ -1257,8 +1271,30 @@ def analyze_gt_sequence(
         # No summary grids here any more -- the per-candidate files below are
         # full resolution, and a tiled figure of six downsampled panels never
         # showed anything the files themselves do not.
-        for f, slug in zip(frames, slugs):
-            save_candidate(f, cmp_dir / f"cmp_{slug}.png")
+        #
+        # Two passes, because the shared display gain cannot be known until
+        # every candidate has been demosaiced: it is set by the brightest pixel
+        # in the whole set. The linear frames are cached in a memmap rather than
+        # held in RAM (a 12 MP RGB float32 frame is 144 MB, and the demosaic
+        # itself already peaks around 2.5 GB) and rather than demosaiced twice
+        # (that is the expensive step, ~27 s a frame).
+        lin_path = cmp_dir / "_linear_tmp.npy"
+        lin = np.lib.format.open_memmap(
+            lin_path, mode='w+', dtype=np.float32,
+            shape=(len(frames), *frames[0].shape, 3))
+        try:
+            for i, f in progress(list(enumerate(frames)), desc="  demosaic",
+                                 total=len(frames)):
+                lin[i] = demosaic_linear(f, pattern, wb, ccm)
+            gain = uniform_gain(lin)
+            print(f"  Uniform display gain: ×{gain:.3f} "
+                  f"(largest that clips nothing in any candidate); "
+                  f"plus an ungained version of each")
+            for i, (f, slug) in enumerate(zip(frames, slugs)):
+                save_candidate(f, lin[i], gain, cmp_dir / f"cmp_{slug}")
+        finally:
+            del lin
+            lin_path.unlink(missing_ok=True)
 
         print("\n  Residual pixel noise (high-pass std, calibrated units)")
         width = max(len(l) for l in labels) + 2
@@ -1360,7 +1396,7 @@ def _apply_cli_overrides() -> None:
 
 def main():
     _apply_cli_overrides()
-    # demosaic_to_rgb() is called from a dozen places here with no method
+    # demosaic_linear() is called from several places here with no method
     # argument; setting the library default once is simpler than threading it
     # through all of them, and keeps DEMOSAIC in the CONFIG block that
     # run_info.json captures.

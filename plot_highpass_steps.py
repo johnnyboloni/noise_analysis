@@ -35,7 +35,7 @@ import matplotlib.pyplot as plt
 from raw_utils import (
     detect_format, find_dngs, find_raws,
     get_raw_metadata, get_raw_metadata_gn3,
-    load_raw, load_raw_gn3, calibrate_frame, demosaic_to_rgb,
+    load_raw, load_raw_gn3, calibrate_frame, demosaic_linear,
     progress, format_duration, _HAS_CV2,
 )
 

@@ -409,12 +409,16 @@ def get_color_metadata(path: Path) -> tuple[np.ndarray, np.ndarray]:
     return wb / wb[1], cm
 
 
-def demosaic_to_rgb(bayer: np.ndarray, pattern: np.ndarray,
+def demosaic_linear(bayer: np.ndarray, pattern: np.ndarray,
                     wb: np.ndarray | None = None,
                     ccm: np.ndarray | None = None,
                     method: str | None = None) -> np.ndarray:
     """
-    Full-resolution RGB from a 2D float32 calibrated Bayer array.
+    Full-resolution SCENE-LINEAR RGB from a 2D float32 calibrated Bayer array.
+
+    Stops at linear light -- no exposure scaling, no gamma. Pass the result to
+    encode_rgb() to get something displayable; keeping the two apart is what
+    lets a set of frames share one exposure (see uniform_gain).
 
     White-balances at the Bayer stage (using `wb`, or a gray-world estimate
     if not given -- a per-channel *global percentile stretch* was tried
@@ -424,9 +428,9 @@ def demosaic_to_rgb(bayer: np.ndarray, pattern: np.ndarray,
     verified against rawpy.postprocess() on a synthetic ground-truth DNG,
     e.g. a neutral gray patch came out as [0, 0, 81] instead of ~[113,109,106]).
 
-    Demosaics with `method` (default DEMOSAIC_METHOD), optionally applies a
+    Demosaics with `method` (default DEMOSAIC_METHOD) and optionally applies a
     camera color-correction matrix (`ccm`, camera RGB -> output RGB, e.g. from
-    get_color_metadata), then gamma-encodes. Returns float32 H×W×3 in [0, 1].
+    get_color_metadata). Returns float32 H×W×3 in [0, 1].
 
     Choice of method. Measured on a synthetic text-like target (1-2 px strokes,
     coloured bars and a zone plate) mosaicked to RGGB and demosaicked back,
@@ -476,21 +480,45 @@ def demosaic_to_rgb(bayer: np.ndarray, pattern: np.ndarray,
 
     if ccm is not None:
         rgb = np.clip(rgb @ ccm.T, 0, 1)
+    return rgb
 
-    # Auto-brighten to match rawpy.postprocess()'s default (no_auto_bright=
-    # False, used for the per-frame sample previews): without an adaptive
-    # exposure boost, linear sensor data -- especially from a lowlight
-    # sequence -- renders much darker here than in those previews even
-    # though both are otherwise the same WB+CCM+gamma pipeline. Scale so the
-    # 99th-percentile pixel lands near displayable white, leaving headroom.
-    hi = float(np.percentile(rgb, 99))
-    if hi > 1e-6:
-        rgb = np.clip(rgb / hi * 0.92, 0, 1)
 
-    # Sensor data is linear in scene light; sRGB display expects gamma-encoded
-    # values, or the image looks dark and flat (rawpy's postprocess applies
-    # this internally for the DNG path, but this cv2/manual path never did).
-    return rgb ** (1.0 / 2.2)
+def encode_rgb(linear: np.ndarray, gain: float = 1.0,
+               gamma: float = 2.2) -> np.ndarray:
+    """
+    Scene-linear RGB -> display-encoded float32 in [0, 1]: multiply by `gain`,
+    clip, gamma-encode.
+
+    `gain` is an explicit number so a set of frames can be encoded on ONE
+    shared scale and stay comparable. The old behaviour here was a per-image
+    auto-brighten (divide by the image's own 99th percentile, target 0.92),
+    which made every PNG its own exposure: two candidates with genuinely
+    different brightness rendered the same, a candidate whose p99 moved --
+    defect repair removing hot pixels, say -- silently got a different scale
+    from the one beside it, and the top 1% of every image was clipped by
+    construction. Use uniform_gain() to pick a gain that clips nothing.
+
+    Gamma stays: sensor data is linear in scene light and an sRGB display
+    expects it encoded, or the image reads dark and flat.
+    """
+    out = np.asarray(linear, dtype=np.float32)
+    if gain != 1.0:
+        out = out * np.float32(gain)
+    return np.clip(out, 0.0, 1.0) ** np.float32(1.0 / gamma)
+
+
+def uniform_gain(frames, headroom: float = 1.0) -> float:
+    """
+    The largest gain that clips nothing in any of `frames` (scene-linear RGB).
+
+    Returns headroom / max(frame.max()), or 1.0 if they are all black. Applying
+    one gain to every frame keeps them radiometrically comparable: a pixel that
+    looks brighter in one PNG really is brighter. Because the gain is set by the
+    brightest single pixel anywhere in the set, one hot pixel or specular
+    highlight holds the whole set down -- that is the price of not clipping.
+    """
+    peak = max((float(np.asarray(f).max()) for f in frames), default=0.0)
+    return headroom / peak if peak > 1e-9 else 1.0
 
 
 def highpass_std(frame: np.ndarray, pattern: np.ndarray, ksize: int = 5) -> float:

@@ -23,7 +23,7 @@ N-independent constant) and would look flat no matter how many frames were
 averaged.
 
 Demosaiced std is computed per RGB channel and averaged, on a crop taken from
-the FULL demosaiced frame -- not by demosaicing the crop alone. demosaic_to_rgb
+the FULL demosaiced frame -- not by demosaicing the crop alone. The gain
 auto-brightens by the frame's own 99th percentile, so demosaicing each crop
 separately would renormalise every checkpoint to its own range and mask the
 very improvement this plot is measuring.
@@ -50,7 +50,8 @@ import matplotlib.patches as mpatches
 from raw_utils import (
     detect_format, find_dngs, find_raws,
     get_raw_metadata, get_raw_metadata_gn3, get_color_metadata,
-    load_raw, load_raw_gn3, calibrate_frame, demosaic_to_rgb,
+    load_raw, load_raw_gn3, calibrate_frame, demosaic_linear, encode_rgb,
+    uniform_gain,
     progress, format_duration,
 )
 
@@ -139,8 +140,9 @@ def collect(paths, pattern, black, white, loader, ns, wb, ccm):
         if box is None:
             box = _resolve_crop(cal.shape)
         # Demosaic the whole frame, then crop: the auto-brighten inside
-        # demosaic_to_rgb is driven by the full frame's 99th percentile.
-        rgb = demosaic_to_rgb(cal, pattern, wb, ccm)
+        # the display gain is driven by the full frame's peak.
+        lin = demosaic_linear(cal, pattern, wb, ccm)
+        rgb = encode_rgb(lin, gain=uniform_gain([lin]))
         rows.append({'n': idx,
                      'bayer': _bayer_crop_std(cal, pattern, box),
                      'rgb':   _rgb_crop_std(rgb, box)})

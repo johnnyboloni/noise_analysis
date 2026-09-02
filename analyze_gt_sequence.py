@@ -10,9 +10,10 @@ Outputs (saved to OUTPUT_DIR/<sequence_name><RUN_SUFFIX>/):
                              was dirty, plus the entire CONFIG block. A results
                              directory that cannot be traced back to a code
                              state and a set of settings is guesswork later.
-  - comparison/            : every GT candidate -- mean, median, trimmed mean,
-                             defect-repaired, dark-subtracted and the gain=1
-                             still -- each written full-resolution as .png (to
+  - comparison/            : every GT candidate -- mean, defect-repaired,
+                             dark-subtracted, the gain=1 still, and (with
+                             ROBUST_AGGREGATORS) median and trimmed mean --
+                             each written full-resolution as .png (to
                              look at), .npy and .dng (to feed onward), with
                              their residual pixel noise printed. This is the
                              only place frame data is written; there are no
@@ -98,6 +99,24 @@ RUN_SUFFIX    = "_menon_demosaic"   # appended to the per-sequence output dir, s
 GN3_BLACK_LEVEL = 256    # uniform black level for GN3 .raw files
 
 MAX_FRAMES    = None  # int to cap total frames loaded, None = all
+ROBUST_AGGREGATORS = False  # also produce a median and a trimmed mean, as extra
+                      # GT candidates alongside the plain mean. Off by default:
+                      # they cost a second read pass over the sequence plus a
+                      # MAX_STACK-sized scratch file on disk, and they can only
+                      # win if the sequence has outliers (cosmic rays, dropped
+                      # or corrupt frames, a light flicker, something crossing
+                      # the scene). For clean Gaussian noise the mean is the
+                      # minimum-variance estimator and the median costs 25% more
+                      # noise -- and because these run on MAX_STACK frames while
+                      # the mean runs on all of them, the median here actually
+                      # starts out 1.253*sqrt(N/MAX_STACK) noisier (~4.5x at
+                      # N=760, MAX_STACK=60), so outliers would have to be
+                      # blatant to overcome that.
+                      #
+                      # Turn back on to check: if RMS(mean - median) comes out
+                      # near its outlier-free prediction 0.756*sigma1/sqrt(N),
+                      # there are no outliers and the mean wins outright. To
+                      # compare them fairly, raise MAX_STACK to N first.
 MAX_STACK     = 60    # max frames loaded into RAM for median / trimmed-mean
 TRIM_FRAC     = 0.05  # total fraction trimmed (symmetric: TRIM_FRAC/2 from each tail)
 
@@ -1054,14 +1073,16 @@ def analyze_gt_sequence(
                          seq_out / f"gt_stationarity_N{n}.png")
 
     # Median + trimmed mean (disk-backed, no full-stack RAM alloc)
-    n_stack  = min(max_stack, n)
-    tmp_path = seq_out / "_stack_tmp.npy"
-    trim_k   = max(1, int(TRIM_FRAC / 2 * n_stack))
-    print(f"  Writing {n_stack}/{n} frames to disk, then computing "
-          f"median and trimmed mean (trim_k={trim_k}) …")
-    median_frame, trimmed_frame = _compute_median_and_trimmed(
-        paths, n_stack, pattern, black, white, loader, TRIM_FRAC, tmp_path,
-    )
+    median_frame = trimmed_frame = None
+    n_stack = min(max_stack, n) if ROBUST_AGGREGATORS else 0
+    if ROBUST_AGGREGATORS:
+        tmp_path = seq_out / "_stack_tmp.npy"
+        trim_k   = max(1, int(TRIM_FRAC / 2 * n_stack))
+        print(f"  Writing {n_stack}/{n} frames to disk, then computing "
+              f"median and trimmed mean (trim_k={trim_k}) …")
+        median_frame, trimmed_frame = _compute_median_and_trimmed(
+            paths, n_stack, pattern, black, white, loader, TRIM_FRAC, tmp_path,
+        )
 
     # Full-resolution saves: an RGB PNG to look at, and a DNG to feed onward.
     # The DNG carries the sequence's own black/white levels and camera profile,
@@ -1202,9 +1223,10 @@ def analyze_gt_sequence(
     # (frame, human label for figures, filename slug). The slug is explicit
     # rather than derived from the label -- deriving it produced names like
     # "cmp_Mean_+_defects_interpolated.png".
-    cands = [(full_mean,     f"Mean  (N={n})",                 "mean"),
-             (median_frame,  f"Median  (N={n_stack})",         "median"),
-             (trimmed_frame, f"Trimmed mean  (N={n_stack})",   "trimmed_mean")]
+    cands = [(full_mean, f"Mean  (N={n})", "mean")]
+    if median_frame is not None:
+        cands += [(median_frame,  f"Median  (N={n_stack})",       "median"),
+                  (trimmed_frame, f"Trimmed mean  (N={n_stack})", "trimmed_mean")]
     if mean_defect_fixed is not None:
         cands.append((mean_defect_fixed,
                       f"Mean + defects interpolated  (N={n})", "mean_defectfix"))

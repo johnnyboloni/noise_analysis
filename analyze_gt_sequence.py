@@ -10,40 +10,38 @@ Outputs (saved to OUTPUT_DIR/<sequence_name><RUN_SUFFIX>/):
                              was dirty, plus the entire CONFIG block. A results
                              directory that cannot be traced back to a code
                              state and a set of settings is guesswork later.
-  - gt_sample_frames.png   : evenly-spaced sample frames (RGB)
-  - gt_aggregated.png      : mean / median / trimmed-mean side-by-side (RGB)
-  - gt_differences.png     : (mean−median), (mean−trimmed), (median−trimmed) heatmaps
-  - gt_mean_darksub_*      : mean frame minus a sigma-clipped master dark,
-                             with a report of how many dark frames the master
-                             actually wants (only when DARK_DIR is set)
-  - gt_*_defectfix_*       : "defectfix" = pixels on the defect map rebuilt
-                             from their same-colour neighbours (DEFECT_FILL
-                             chooses median or directional). Produced both
-                             with and without the dark subtraction, so the two
-                             corrections can be judged separately. Every
-                             repaired pixel is a guess, so a large defect map
-                             costs real detail -- the run warns about that.
-  - comparison/            : every GT candidate together -- mean, median,
-                             trimmed mean, defect-repaired, dark-subtracted and
-                             gain=1 stills -- as full frames, 100% crops, and
-                             difference maps against the plain mean, with their
-                             residual pixel noise printed
+  - comparison/            : every GT candidate -- mean, median, trimmed mean,
+                             defect-repaired, dark-subtracted and the gain=1
+                             still -- each written full-resolution as .png (to
+                             look at), .npy and .dng (to feed onward), with
+                             their residual pixel noise printed. This is the
+                             only place frame data is written; there are no
+                             duplicate copies at the top level.
   - gt_checkpoint_noise.png: measured noise vs frames averaged -- split-half
                              temporal noise (unbiased; the two halves share no
                              frames) alongside the high-pass residual, against
                              a 1/sqrt(N) reference. Where the two diverge the
                              frame is fixed-pattern-noise limited.
-  - gt_running_mean_*      : the running mean at log-spaced checkpoints, plus a
-                             100%-zoom comparison and the split-half difference
-                             at each checkpoint (temporal noise alone -- scene
-                             and FPN cancel in the subtraction)
+  - gt_running_mean_comparison_*, gt_halfdiff_comparison_*
+                           : a 100%-zoom crop of the running mean at each
+                             checkpoint, and the split-half difference at each
+                             checkpoint (temporal noise alone -- scene and FPN
+                             cancel in the subtraction)
   - gt_defect_map.png/.npy : hot/cold pixels found in the master dark
-                             (only when DARK_DIR is set)
+  - gt_defect_sigma_scan.png
+                           : flagged fraction vs threshold, for choosing
+                             HOT_PIXEL_SIGMA (only when DARK_DIR is set)
   - gt_stationarity_*.png  : frame level over the run, plus a first-half vs
                              second-half check. Averaging assumes every frame
                              shows the same thing; if the sensor warmed or the
                              lighting drifted, that error does not average away
                              and the split-half noise estimate cannot see it.
+
+"defectfix" in a candidate name means pixels on the defect map were rebuilt
+from their same-colour neighbours (DEFECT_FILL chooses median or directional).
+Candidates are produced both with and without the dark subtraction, so the two
+corrections can be judged separately. Every repaired pixel is a guess, so a
+large defect map costs real detail -- the run warns about that.
 
 Correction order matters and is fixed: average, then subtract the dark, then
 interpolate defects. Interpolating before the subtraction removes a defect's
@@ -72,8 +70,8 @@ import raw_utils
 from raw_utils import (
     detect_format, find_dngs, find_raws,
     get_raw_metadata, get_raw_metadata_gn3, get_color_metadata,
-    load_raw, load_raw_gn3, load_raw_rgb, load_raw_rgb_gn3,
-    calibrate_frame, demosaic_to_rgb, plot_sample_frames, save_rgb_png,
+    load_raw, load_raw_gn3,
+    calibrate_frame, demosaic_to_rgb, save_rgb_png,
     highpass_std, bayer_plane_median3, directional_fill_bayer,
     progress, prefetch, format_duration,
     uncalibrate_frame, save_dng, get_dng_color_matrix, git_revision,
@@ -102,9 +100,8 @@ GN3_BLACK_LEVEL = 256    # uniform black level for GN3 .raw files
 MAX_FRAMES    = None  # int to cap total frames loaded, None = all
 MAX_STACK     = 60    # max frames loaded into RAM for median / trimmed-mean
 TRIM_FRAC     = 0.05  # total fraction trimmed (symmetric: TRIM_FRAC/2 from each tail)
-N_SAMPLES     = 5     # number of evenly-spaced sample frames to show
 
-N_CHECKPOINTS   = 5     # running-mean snapshots saved while streaming (log-spaced in N)
+N_CHECKPOINTS   = 5     # running-mean snapshots taken while streaming (log-spaced in N)
 CHECKPOINT_CROP = 400   # centre-crop size (px) for the 100%-zoom checkpoint comparison
 
 DARK_DIR        = None  # dir of dark frames (lens capped, same gain/exposure).
@@ -156,7 +153,6 @@ STILLS_FRAMES   = 1     # how many stills to use. 1 (default) keeps this an
 MATCH_STILL_INTENSITY = True   # rescale the stills by a robust ratio so the
                                # comparison is not dominated by an exposure
                                # mismatch between the two capture settings
-COMPARISON_CROP = 400   # centre-crop size (px) for the 100%-zoom comparison
 SAVE_DNG        = True  # write a .dng next to every GT candidate PNG, in raw
                         # ADU with the black pedestal restored, so downstream
                         # tools read it exactly like an original capture
@@ -175,25 +171,21 @@ SAVE_NPY        = True  # write a .npy too: the calibrated float32 frame, before
 
 def _make_loaders(directory: str):
     """
-    Detect format and return (fmt, paths, pattern, black, white, loader, sample_fn).
-    loader(path)     → float32 (H, W) raw Bayer ADU
-    sample_fn(path)  → uint8  (H, W, 3) demosaiced RGB
+    Detect format and return (fmt, paths, pattern, black, white, loader).
+    loader(path) → float32 (H, W) raw Bayer ADU
     """
     fmt = detect_format(directory)
     if fmt == 'dng':
         paths     = find_dngs(directory)
         pattern, black, white = get_raw_metadata(paths[0])
         loader    = load_raw
-        sample_fn = load_raw_rgb
     else:
         paths     = find_raws(directory)
         pattern, black, white = get_raw_metadata_gn3(paths[0], GN3_BLACK_LEVEL)
         meta      = json.loads(paths[0].with_suffix('.imgprops').read_text())
         shape     = (meta['height'], meta['width'])
         loader    = lambda p, _s=shape: load_raw_gn3(p, _s)
-        sample_fn = lambda p, _s=shape, _pat=pattern, _bl=black, _wh=white: \
-            load_raw_rgb_gn3(p, _s, _pat, _bl, _wh)
-    return fmt, paths, pattern, black, white, loader, sample_fn
+    return fmt, paths, pattern, black, white, loader
 
 
 # --------------------------------------------------------------------------- #
@@ -748,7 +740,7 @@ def _stills_reference(directory, shape, match_to=None):
     difference map. The ratio is taken over pixels above a low threshold, since
     near-black pixels give an unstable ratio.
     """
-    fmt, paths, pattern, black, white, loader, _ = _make_loaders(directory)
+    fmt, paths, pattern, black, white, loader = _make_loaders(directory)
     n = max(1, min(int(STILLS_FRAMES or 1), len(paths)))
     if n == 1:
         accum = loader(paths[0]).astype(np.float64)
@@ -774,76 +766,8 @@ def _stills_reference(directory, shape, match_to=None):
     return cal, n, scale
 
 
-def _grid(n, per_row=3):
-    """Rows/cols for n panels -- a single row gets unreadably wide past three."""
-    cols = min(per_row, n)
-    return int(np.ceil(n / cols)), cols
 
 
-def _plot_comparison(frames, labels, pattern, out, wb=None, ccm=None):
-    """RGB of every GT candidate, in a grid."""
-    rows, cols = _grid(len(frames))
-    fig, axes = plt.subplots(rows, cols, figsize=(6.2 * cols, 5.4 * rows),
-                             squeeze=False)
-    flat = axes.ravel()
-    for ax, f, lab in zip(flat, frames, labels):
-        ax.imshow(demosaic_to_rgb(f, pattern, wb, ccm))
-        ax.set_title(lab, fontsize=10)
-        ax.axis("off")
-    for ax in flat[len(frames):]:
-        ax.axis("off")
-    fig.suptitle("GT candidates", fontsize=13, y=1.01)
-    fig.tight_layout()
-    fig.savefig(out, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"Saved {out}")
-
-
-def _plot_comparison_crops(frames, labels, pattern, out, crop, wb=None, ccm=None):
-    """100%-zoom centre crops -- downscaling would hide the pixel-level
-    differences these candidates are being compared on."""
-    rows, cols = _grid(len(frames))
-    fig, axes = plt.subplots(rows, cols, figsize=(4.6 * cols, 5.2 * rows),
-                             squeeze=False)
-    flat = axes.ravel()
-    for ax in flat[len(frames):]:
-        ax.axis("off")
-    for ax, f, lab in zip(flat, frames, labels):
-        rgb = demosaic_to_rgb(f, pattern, wb, ccm)
-        cy, cx = rgb.shape[0] // 2, rgb.shape[1] // 2
-        h = min(crop, rgb.shape[0]) // 2
-        w = min(crop, rgb.shape[1]) // 2
-        ax.imshow(rgb[cy - h: cy + h, cx - w: cx + w], interpolation="nearest")
-        ax.set_title(lab, fontsize=10)
-        ax.axis("off")
-    fig.suptitle(f"GT candidates — {crop}×{crop} centre crop at 100% zoom",
-                 fontsize=13, y=1.02)
-    fig.tight_layout()
-    fig.savefig(out, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"Saved {out}")
-
-
-def _plot_comparison_diffs(pairs, out):
-    """Signed difference maps between GT candidates, symmetric colour scales."""
-    rows, cols = _grid(len(pairs))
-    fig, axes = plt.subplots(rows, cols, figsize=(6.2 * cols, 5.2 * rows),
-                             squeeze=False)
-    flat = axes.ravel()
-    for ax in flat[len(pairs):]:
-        ax.axis("off")
-    for ax, (diff, lab) in zip(flat, pairs):
-        v = max(float(np.percentile(np.abs(diff), 99.5)), 1e-9)
-        im = ax.imshow(diff, cmap="RdBu_r", vmin=-v, vmax=v)
-        ax.set_title(f"{lab}\nstd = {diff.std():.6f}", fontsize=10)
-        ax.axis("off")
-        fig.colorbar(im, ax=ax, fraction=0.035, pad=0.02)
-    fig.suptitle("What each step changed, relative to the plain mean",
-                 fontsize=13, y=1.01)
-    fig.tight_layout()
-    fig.savefig(out, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"Saved {out}")
 
 
 def _report_floor(metrics, margins=(3.0, 5.0)):
@@ -1044,45 +968,6 @@ def _plot_checkpoint_crops(crops, out, crop_size):
     print(f"Saved {out}")
 
 
-def _plot_aggregated(mean, median, trimmed, pattern, n_stack, out,
-                     wb: np.ndarray | None = None, ccm: np.ndarray | None = None):
-    frames = [mean, median, trimmed]
-    titles = [
-        "Mean (all frames)",
-        f"Median  (N={n_stack})",
-        f"Trimmed mean  (N={n_stack}, trim={TRIM_FRAC:.0%})",
-    ]
-    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
-    for ax, f, t in zip(axes, frames, titles):
-        ax.imshow(demosaic_to_rgb(f, pattern, wb, ccm), aspect="auto")
-        ax.set_title(t, fontsize=10)
-        ax.axis("off")
-    fig.suptitle("GT aggregation methods", fontsize=13, y=1.01)
-    fig.tight_layout()
-    fig.savefig(out, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"Saved {out}")
-
-
-def _plot_differences(mean, median, trimmed, out):
-    pairs = [
-        (mean - median,    "mean − median"),
-        (mean - trimmed,   "mean − trimmed"),
-        (median - trimmed, "median − trimmed"),
-    ]
-    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
-    for ax, (diff, title) in zip(axes, pairs):
-        vmax = max(float(np.percentile(np.abs(diff), 99.5)), 1e-6)
-        im = ax.imshow(diff, cmap="RdBu_r", vmin=-vmax, vmax=vmax, aspect="auto")
-        ax.set_title(title, fontsize=10)
-        ax.axis("off")
-        fig.colorbar(im, ax=ax, fraction=0.03, pad=0.02)
-    fig.suptitle("Method differences — where aggregators disagree (outlier / hot-pixel locations)",
-                 fontsize=12, y=1.01)
-    fig.tight_layout()
-    fig.savefig(out, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"Saved {out}")
 
 
 def analyze_gt_sequence(
@@ -1108,7 +993,7 @@ def analyze_gt_sequence(
               + ("  (WORKING TREE DIRTY)" if rev['dirty'] else "")
               + f"  — {rev['subject']}")
 
-    fmt, paths, pattern, black, white, loader, sample_fn = _make_loaders(directory)
+    fmt, paths, pattern, black, white, loader = _make_loaders(directory)
     if max_frames is not None:
         paths = paths[:max_frames]
     n = len(paths)
@@ -1117,21 +1002,6 @@ def analyze_gt_sequence(
     # DNG carries a real camera white-balance + color-correction profile;
     # GN3 has none, so demosaic_to_rgb falls back to gray-world WB / no CCM.
     wb, ccm = (get_color_metadata(paths[0]) if fmt == 'dng' else (None, None))
-
-    # Sample frames
-    sample_idx = np.linspace(0, n - 1, min(N_SAMPLES, n), dtype=int)
-    sample_frames = [sample_fn(paths[i]) for i in sample_idx]
-    plot_sample_frames(
-        sample_frames,
-        [f"frame {i}" for i in sample_idx],
-        seq_out / f"gt_sample_frames_N{n}.png",
-    )
-    # Individual full-resolution PNGs (no matplotlib tiling/downsampling) so
-    # sample frames can be pixel-inspected directly, e.g. to check whether an
-    # apparent grid/moire artifact is real or an artifact of the composite
-    # plot above being resampled to fit multiple panels in one figure.
-    for i, frame in zip(sample_idx, sample_frames):
-        save_rgb_png(frame, seq_out / f"gt_sample_frame_{i:04d}_N{n}_full.png")
 
     # Pass 1: full streaming mean, snapshotting the running mean along the way.
     # Checkpoints are log-spaced because noise falls as 1/sqrt(N) -- linear
@@ -1148,10 +1018,11 @@ def analyze_gt_sequence(
         return a[cy - h: cy + h, cx - w: cx + w].copy()
 
     def _on_checkpoint(idx, running, half_diff):
-        # Demosaic once and reuse for both the full-res save and the crop --
-        # demosaicing a full-size frame is the expensive part of this callback.
+        # Only the crop is kept; the full-size running-mean PNGs were dropped
+        # once the convergence question was settled. The demosaic still has to
+        # run on the whole frame -- demosaicing a crop would give the crop its
+        # own auto-brighten scaling and stop the panels being comparable.
         rgb = demosaic_to_rgb(running, pattern, wb, ccm)
-        save_rgb_png(rgb, seq_out / f"gt_running_mean_N{idx:05d}.png")
         ckpt_crops.append((idx, _crop_centre(rgb, CHECKPOINT_CROP)))
         if half_diff is None:
             return
@@ -1192,13 +1063,6 @@ def analyze_gt_sequence(
         paths, n_stack, pattern, black, white, loader, TRIM_FRAC, tmp_path,
     )
 
-    # Plots
-    print("  Plotting …")
-    _plot_aggregated(full_mean, median_frame, trimmed_frame, pattern, n_stack,
-                     seq_out / f"gt_aggregated_N{n}_stack{n_stack}.png", wb, ccm)
-    _plot_differences(full_mean, median_frame, trimmed_frame,
-                      seq_out / f"gt_differences_N{n}_stack{n_stack}.png")
-
     # Full-resolution saves: an RGB PNG to look at, and a DNG to feed onward.
     # The DNG carries the sequence's own black/white levels and camera profile,
     # so a GT frame drops into the same tooling as an original capture.
@@ -1234,11 +1098,6 @@ def analyze_gt_sequence(
                      model=f"noise_analysis GT ({seq_name})",
                      copy_tags=dng_tags)
 
-    print("  Saving full-resolution frames …")
-    save_candidate(full_mean,     seq_out / f"gt_mean_rgb_N{n}.png")
-    save_candidate(median_frame,  seq_out / f"gt_median_rgb_N{n_stack}.png")
-    save_candidate(trimmed_frame, seq_out / f"gt_trimmed_mean_rgb_N{n_stack}.png")
-
     # ---------------------------------------------------------------- #
     # Dark subtraction                                                   #
     # ---------------------------------------------------------------- #
@@ -1246,7 +1105,7 @@ def analyze_gt_sequence(
     mean_defect_fixed = None
     if DARK_DIR:
         print(f"\n  Dark frames: {DARK_DIR}")
-        _, d_paths, d_pattern, _, _, d_loader, _ = _make_loaders(DARK_DIR)
+        _, d_paths, d_pattern, _, _, d_loader = _make_loaders(DARK_DIR)
         if not np.array_equal(d_pattern, pattern):
             sys.exit(f"Dark frames have Bayer pattern {d_pattern.tolist()}, "
                      f"sequence has {pattern.tolist()} -- not the same sensor "
@@ -1263,8 +1122,6 @@ def analyze_gt_sequence(
               f"min={dark_adu.min():.2f}  max={dark_adu.max():.2f}  "
               f"(black level {black[0]:.1f})")
         dark_corrected = _dark_correct(full_mean_adu, dark_adu, pattern, black, white)
-        save_candidate(dark_corrected,
-                       seq_out / f"gt_mean_darksub_rgb_N{n}.png")
 
         hp_before = highpass_std(full_mean, pattern)
         hp_after  = highpass_std(dark_corrected, pattern)
@@ -1333,10 +1190,6 @@ def analyze_gt_sequence(
                       f"mean+defectfix={highpass_std(mean_fixed, pattern):.6f}")
                 print(f"                  darksub={hp_after:.6f}  "
                       f"darksub+defectfix={highpass_std(dark_fixed, pattern):.6f}")
-                save_candidate(mean_fixed,
-                               seq_out / f"gt_mean_defectfix_rgb_N{n}.png")
-                save_candidate(dark_fixed,
-                               seq_out / f"gt_mean_darksub_defectfix_rgb_N{n}.png")
                 mean_defect_fixed = mean_fixed
                 dark_corrected    = dark_fixed
 
@@ -1379,18 +1232,9 @@ def analyze_gt_sequence(
         frames = [c[0] for c in cands]
         labels = [c[1] for c in cands]
         slugs  = [c[2] for c in cands]
-        _plot_comparison(frames, labels, pattern,
-                         cmp_dir / "cmp_frames.png", wb, ccm)
-        _plot_comparison_crops(frames, labels, pattern,
-                               cmp_dir / "cmp_crops.png", COMPARISON_CROP, wb, ccm)
-        # Every candidate differenced against the plain mean, rather than all
-        # pairs: with six candidates all-pairs is fifteen panels, and "what did
-        # this step change relative to doing nothing" is the question that
-        # actually gets asked.
-        _plot_comparison_diffs(
-            [(frames[i] - frames[0], f"{labels[i].split('(')[0].strip()}  −  Mean")
-             for i in range(1, len(frames))],
-            cmp_dir / "cmp_differences.png")
+        # No summary grids here any more -- the per-candidate files below are
+        # full resolution, and a tiled figure of six downsampled panels never
+        # showed anything the files themselves do not.
         for f, slug in zip(frames, slugs):
             save_candidate(f, cmp_dir / f"cmp_{slug}.png")
 

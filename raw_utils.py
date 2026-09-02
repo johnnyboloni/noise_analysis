@@ -128,6 +128,18 @@ except ImportError:
           "interpolated (VNG) demosaicing. Install opencv-python(-headless) "
           "for full-resolution, properly interpolated output.", file=sys.stderr)
 
+try:
+    from colour_demosaicing import (demosaicing_CFA_Bayer_Malvar2004,
+                                    demosaicing_CFA_Bayer_Menon2007)
+    _HAS_COLOUR_DEMOSAICING = True
+except ImportError:
+    _HAS_COLOUR_DEMOSAICING = False
+    print("WARNING: colour-demosaicing not importable -- demosaic_to_rgb() will "
+          "fall back to cv2's edge-aware demosaic, which measures ~6 dB worse on "
+          "edges and leaves noticeably more false colour on fine detail. "
+          "Install colour-demosaicing for the 'menon'/'malvar' methods.",
+          file=sys.stderr)
+
 
 # --------------------------------------------------------------------------- #
 # Bayer pattern lookup (GN3 .imgprops bayerOrder → 2×2 pattern array)         #
@@ -279,6 +291,69 @@ def _cv2_bayer_code(pattern: np.ndarray, suffix: str = '_EA') -> int:
     return getattr(cv2, name + suffix)
 
 
+def _cfa_pattern_str(pattern: np.ndarray) -> str:
+    """
+    Map rawpy's 2×2 Bayer pattern to a colour-demosaicing CFA string.
+
+    Unlike cv2 (see _cv2_bayer_code), colour-demosaicing names the pattern
+    literally: the four letters are the colours at (0,0), (0,1), (1,0), (1,1)
+    in that order, with rawpy's second green (index 3) folded onto 'G'.
+    Verified against the cv2 path on synthetic ground truth for all four
+    patterns -- both reproduce the same colours.
+    """
+    letters = 'RGBG'
+    return ''.join(letters[int(pattern[r, c])] for r in range(2) for c in range(2))
+
+
+#: Default demosaic algorithm for demosaic_to_rgb(). See its docstring for the
+#: measured comparison; 'menon' is the best of the available methods and is
+#: what the previews and comparison crops are rendered with.
+DEMOSAIC_METHOD = 'menon'
+
+
+def _demosaic_bayer(balanced: np.ndarray, pattern: np.ndarray,
+                    method: str) -> np.ndarray:
+    """
+    Interpolate a white-balanced Bayer plane in [0, 1] to float32 H×W×3.
+
+    method: 'menon' (DDFAPD, Menon 2007), 'malvar' (Malvar 2004), 'ea' (cv2
+    edge-aware) or 'half' (no interpolation -- nearest-neighbour channel
+    extraction, the fallback when nothing else is importable).
+
+    'menon' and 'malvar' come from colour-demosaicing and work directly on the
+    float array. 'ea' goes through cv2, which needs an integer buffer: the data
+    is stretched into the full 16-bit range before quantizing and unstretched
+    after, because calibrated lowlight data occupies only the bottom percent or
+    so of [0, 1] and quantizing at that native scale throws away the sub-LSB
+    precision that averaging hundreds of frames just bought (which the
+    auto-brighten in demosaic_to_rgb then amplifies back up as visible
+    stepping).
+    """
+    if method in ('menon', 'malvar') and _HAS_COLOUR_DEMOSAICING:
+        fn = (demosaicing_CFA_Bayer_Menon2007 if method == 'menon'
+              else demosaicing_CFA_Bayer_Malvar2004)
+        rgb = fn(balanced.astype(np.float64), _cfa_pattern_str(pattern))
+        return np.clip(np.asarray(rgb, dtype=np.float32), 0.0, 1.0)
+
+    if method != 'half' and _HAS_CV2:
+        pre   = float(np.percentile(balanced, 99.9))
+        pre   = pre if pre > 1e-6 else 1.0
+        u16   = (np.clip(balanced / pre, 0, 1) * 65535).astype(np.uint16)
+        rgb16 = cv2.cvtColor(u16, _cv2_bayer_code(pattern))
+        return rgb16.astype(np.float32) / 65535.0 * pre
+
+    channels = {int(pattern[r, c]): balanced[r::2, c::2]
+                for r in range(2) for c in range(2)}
+    half_res = np.stack([channels[0].astype(np.float32),
+                         ((channels[1] + channels[3]) / 2).astype(np.float32),
+                         channels[2].astype(np.float32)], axis=-1)
+    # Upsample back to full Bayer resolution (nearest-neighbor) so output
+    # dimensions match the interpolating paths regardless of which one ran --
+    # this branch only samples one position per 2×2 tile.
+    full = half_res.repeat(2, axis=0).repeat(2, axis=1)
+    return full[:balanced.shape[0], :balanced.shape[1]]
+
+
 def get_color_metadata(path: Path) -> tuple[np.ndarray, np.ndarray]:
     """
     Return (white_balance[3], color_matrix[3,3]) from a DNG's embedded camera
@@ -294,7 +369,8 @@ def get_color_metadata(path: Path) -> tuple[np.ndarray, np.ndarray]:
 
 def demosaic_to_rgb(bayer: np.ndarray, pattern: np.ndarray,
                     wb: np.ndarray | None = None,
-                    ccm: np.ndarray | None = None) -> np.ndarray:
+                    ccm: np.ndarray | None = None,
+                    method: str | None = None) -> np.ndarray:
     """
     Full-resolution RGB from a 2D float32 calibrated Bayer array.
 
@@ -306,10 +382,33 @@ def demosaic_to_rgb(bayer: np.ndarray, pattern: np.ndarray,
     verified against rawpy.postprocess() on a synthetic ground-truth DNG,
     e.g. a neutral gray patch came out as [0, 0, 81] instead of ~[113,109,106]).
 
-    Demosaics with cv2 VNG if available (else half-res channel extraction),
-    optionally applies a camera color-correction matrix (`ccm`, camera RGB ->
-    output RGB, e.g. from get_color_metadata), then gamma-encodes.
-    Returns float32 H×W×3 in [0, 1].
+    Demosaics with `method` (default DEMOSAIC_METHOD), optionally applies a
+    camera color-correction matrix (`ccm`, camera RGB -> output RGB, e.g. from
+    get_color_metadata), then gamma-encodes. Returns float32 H×W×3 in [0, 1].
+
+    Choice of method. Measured on a synthetic text-like target (1-2 px strokes,
+    coloured bars and a zone plate) mosaicked to RGGB and demosaicked back,
+    scoring PSNR, PSNR on edge pixels only, and false colour (RMS error of the
+    chroma pair (R-G, B-G) on edge pixels -- the artifact that shows up as
+    colour fringing on text):
+
+        method                PSNR   PSNR@edge   falseColour   12 MP
+        cv2 bilinear         29.01       22.66        0.0826    ~2 s
+        cv2 EA               29.12       22.92        0.0860    ~2 s
+        cv2 VNG (8-bit)      30.78       24.94        0.0736    ~4 s
+        Malvar 2004          32.24       25.88        0.0629    ~9 s
+        Menon 2007 (DDFAPD)  35.11       28.01        0.0524   ~27 s
+
+    Menon wins on every metric, by 6 dB over the edge-aware kernel this used
+    previously, and it keeps that lead with noise added to the mosaic (checked
+    at sd = 0.005 / 0.02 / 0.05 of full scale), so it is safe for the noisy
+    single-frame previews too, not just the averaged result. It costs ~27 s and
+    ~2.5 GB of peak memory on a 12 MP frame; 'malvar' is the cheap compromise
+    and 'ea' is the old behaviour.
+
+    Note this only affects the PNG previews and comparison crops -- the GT that
+    feeds a denoiser is the Bayer-domain DNG/NPY, which is never demosaicked
+    here.
     """
     if wb is None:
         means = {}
@@ -330,45 +429,8 @@ def demosaic_to_rgb(bayer: np.ndarray, pattern: np.ndarray,
             ch = int(pattern[r, c])
             balanced[r::2, c::2] = np.clip(bayer[r::2, c::2] * gain_by_idx[ch], 0, 1)
 
-    if _HAS_CV2:
-        # Demosaic at 16 bits. The '_VNG' variant is 8-bit only (it asserts
-        # depth == CV_8U), so this uses '_EA' (edge-aware), which accepts
-        # CV_16U and is verified to follow the same pattern-code naming
-        # convention -- see _cv2_bayer_code.
-        #
-        # Bit depth matters much more than the interpolation kernel here. This
-        # is linear sensor data that gets gamma-encoded on the way out, and
-        # gamma expands the shadows where a lowlight scene lives: one 8-bit
-        # linear LSB (1/255) lands at (1/255)**(1/2.2) ~= 20 display levels
-        # after encoding, so an 8-bit linear buffer bands visibly in exactly
-        # the tones this pipeline cares about. At 16 bits the first LSB is
-        # ~1.6 display levels instead.
-        #
-        # Stretch into the full range BEFORE quantizing, then undo it right
-        # after. Calibrated lowlight data occupies only the bottom percent or
-        # so of [0, 1]; quantizing at that native scale throws away the sub-LSB
-        # precision that averaging hundreds of frames just bought, which the
-        # auto-brighten below then amplifies back up as visible stepping.
-        # Undoing the stretch keeps the CCM and auto-brighten operating on
-        # linear scene-referred values (the CCM's clip does not commute with a
-        # scale factor, so this has to be restored before it, not after).
-        pre = float(np.percentile(balanced, 99.9))
-        pre = pre if pre > 1e-6 else 1.0
-        u16   = (np.clip(balanced / pre, 0, 1) * 65535).astype(np.uint16)
-        rgb16 = cv2.cvtColor(u16, _cv2_bayer_code(pattern))
-        rgb   = rgb16.astype(np.float32) / 65535.0 * pre
-    else:
-        channels = {int(pattern[r, c]): balanced[r::2, c::2]
-                    for r in range(2) for c in range(2)}
-        R = channels[0].astype(np.float32)
-        G = ((channels[1] + channels[3]) / 2).astype(np.float32)
-        B = channels[2].astype(np.float32)
-        half_res = np.stack([R, G, B], axis=-1)
-        # Upsample back to full Bayer resolution (nearest-neighbor) so output
-        # dimensions match the cv2 path regardless of which one ran -- this
-        # branch only samples one position per 2x2 tile, so it's half
-        # resolution in both dimensions before this repeat.
-        rgb = half_res.repeat(2, axis=0).repeat(2, axis=1)[:bayer.shape[0], :bayer.shape[1]]
+    rgb = _demosaic_bayer(balanced, pattern,
+                          method or DEMOSAIC_METHOD)
 
     if ccm is not None:
         rgb = np.clip(rgb @ ccm.T, 0, 1)

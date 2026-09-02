@@ -68,6 +68,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+import raw_utils
 from raw_utils import (
     detect_format, find_dngs, find_raws,
     get_raw_metadata, get_raw_metadata_gn3, get_color_metadata,
@@ -85,7 +86,7 @@ from raw_utils import (
 # ============================================================
 SEQUENCE_DIR  = "/path/to/static/sequence"
 OUTPUT_DIR    = "output/gt_analysis"
-RUN_SUFFIX    = "_single_still"   # appended to the per-sequence output dir, so
+RUN_SUFFIX    = "_menon_demosaic"   # appended to the per-sequence output dir, so
                                    # runs sit side by side instead of
                                    # overwriting each other and the directory
                                    # name says what was being tested.
@@ -131,6 +132,14 @@ DEFECT_FILL     = "median"  # how repaired pixels are rebuilt: "median" (3x3
                             # content a lowlight GT is mostly made of) or
                             # "directional" (follows edges, better on thin
                             # high-contrast detail, noisier elsewhere).
+DEMOSAIC        = "menon"   # demosaic used for the PNG previews and comparison
+                            # crops (the DNG/NPY ground truth stays in the Bayer
+                            # domain and is never demosaiced). "menon" (DDFAPD)
+                            # measures 6 dB better on edges and ~40% less false
+                            # colour than the "ea" this used before, at ~27 s and
+                            # ~2.5 GB per 12 MP frame; "malvar" is the cheap
+                            # middle ground (~9 s), "ea" the old fast default.
+                            # See raw_utils.demosaic_to_rgb for the numbers.
 DEFECT_FRAC_WARN = 0.005  # warn once the defect map exceeds this fraction of the
                           # frame. Every flagged pixel is reconstructed from its
                           # neighbours, so a large map trades noise for lost
@@ -1485,6 +1494,11 @@ def _apply_cli_overrides() -> None:
 
 def main():
     _apply_cli_overrides()
+    # demosaic_to_rgb() is called from a dozen places here with no method
+    # argument; setting the library default once is simpler than threading it
+    # through all of them, and keeps DEMOSAIC in the CONFIG block that
+    # run_info.json captures.
+    raw_utils.DEMOSAIC_METHOD = DEMOSAIC
     print(f"GT sequence analysis: {SEQUENCE_DIR}")
     t0 = time.monotonic()
     analyze_gt_sequence(

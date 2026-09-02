@@ -1365,7 +1365,12 @@ def main():
     # through all of them, and keeps DEMOSAIC in the CONFIG block that
     # run_info.json captures.
     raw_utils.DEMOSAIC_METHOD = DEMOSAIC
+    # Fail here, not at the first preview many minutes into the run, and print
+    # what actually ran -- an unavailable method raises rather than quietly
+    # demosaicing with something else, so this line and run_info.json agree.
+    raw_utils.check_demosaic_method()
     print(f"GT sequence analysis: {SEQUENCE_DIR}")
+    print(f"  Demosaic: {DEMOSAIC}")
     t0 = time.monotonic()
     analyze_gt_sequence(
         SEQUENCE_DIR,

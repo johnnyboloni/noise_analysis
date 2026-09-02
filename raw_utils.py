@@ -123,10 +123,9 @@ try:
     _HAS_CV2 = True
 except ImportError:
     _HAS_CV2 = False
-    print("WARNING: cv2 not importable -- demosaic_to_rgb() will fall back to "
-          "half-resolution nearest-neighbor channel extraction instead of "
-          "interpolated (VNG) demosaicing. Install opencv-python(-headless) "
-          "for full-resolution, properly interpolated output.", file=sys.stderr)
+    print("WARNING: cv2 not importable -- the 'ea' demosaic and the cv2-backed "
+          "helpers are unavailable and will raise if used. Install "
+          "opencv-python(-headless).", file=sys.stderr)
 
 try:
     from colour_demosaicing import (demosaicing_CFA_Bayer_Malvar2004,
@@ -134,11 +133,9 @@ try:
     _HAS_COLOUR_DEMOSAICING = True
 except ImportError:
     _HAS_COLOUR_DEMOSAICING = False
-    print("WARNING: colour-demosaicing not importable -- demosaic_to_rgb() will "
-          "fall back to cv2's edge-aware demosaic, which measures ~6 dB worse on "
-          "edges and leaves noticeably more false colour on fine detail. "
-          "Install colour-demosaicing for the 'menon'/'malvar' methods.",
-          file=sys.stderr)
+    print("WARNING: colour-demosaicing not importable -- the 'menon' and "
+          "'malvar' demosaics are unavailable and will raise if used. "
+          "Install it with `pip install colour-demosaicing`.", file=sys.stderr)
 
 
 # --------------------------------------------------------------------------- #
@@ -305,10 +302,30 @@ def _cfa_pattern_str(pattern: np.ndarray) -> str:
     return ''.join(letters[int(pattern[r, c])] for r in range(2) for c in range(2))
 
 
+#: Every demosaic method _demosaic_bayer accepts. Anything else raises, rather
+#: than falling through to whichever branch happens to match.
+DEMOSAIC_METHODS = ('menon', 'malvar', 'ea', 'half')
+
 #: Default demosaic algorithm for demosaic_to_rgb(). See its docstring for the
 #: measured comparison; 'menon' is the best of the available methods and is
 #: what the previews and comparison crops are rendered with.
 DEMOSAIC_METHOD = 'menon'
+
+
+def check_demosaic_method(method: str | None = None) -> str:
+    """
+    Validate a demosaic method now, and return it.
+
+    Call this at startup. The demosaic does not run until the first preview is
+    written, which on a long sequence is many minutes in -- long enough that a
+    bad method name or a missing package would otherwise waste the whole pass
+    before it surfaced. Probing a 4x4 frame costs nothing and moves the failure
+    to the first second of the run.
+    """
+    method = method or DEMOSAIC_METHOD
+    _demosaic_bayer(np.zeros((4, 4), np.float32),
+                    np.array([[0, 1], [3, 2]], np.int32), method)
+    return method
 
 
 def _demosaic_bayer(balanced: np.ndarray, pattern: np.ndarray,
@@ -318,7 +335,15 @@ def _demosaic_bayer(balanced: np.ndarray, pattern: np.ndarray,
 
     method: 'menon' (DDFAPD, Menon 2007), 'malvar' (Malvar 2004), 'ea' (cv2
     edge-aware) or 'half' (no interpolation -- nearest-neighbour channel
-    extraction, the fallback when nothing else is importable).
+    extraction, half resolution in both axes).
+
+    A method whose library is missing raises rather than quietly demosaicing
+    with something else. Silently substituting a different algorithm is the
+    worst failure mode here: the run completes, run_info.json records the
+    method that was *asked* for, and the only symptom is that the previews look
+    exactly like the previous ones -- which reads as "the change did nothing"
+    rather than "the change never ran". 'half' is always available and is the
+    explicit opt-out for a machine with neither library.
 
     'menon' and 'malvar' come from colour-demosaicing and work directly on the
     float array. 'ea' goes through cv2, which needs an integer buffer: the data
@@ -329,13 +354,30 @@ def _demosaic_bayer(balanced: np.ndarray, pattern: np.ndarray,
     auto-brighten in demosaic_to_rgb then amplifies back up as visible
     stepping).
     """
-    if method in ('menon', 'malvar') and _HAS_COLOUR_DEMOSAICING:
+    if method not in DEMOSAIC_METHODS:
+        raise ValueError(
+            f"unknown demosaic method {method!r}; expected one of "
+            f"{', '.join(sorted(DEMOSAIC_METHODS))}")
+
+    if method in ('menon', 'malvar'):
+        if not _HAS_COLOUR_DEMOSAICING:
+            raise ImportError(
+                f"demosaic method {method!r} needs the colour-demosaicing "
+                f"package, which is not importable. Install it with "
+                f"`pip install colour-demosaicing`, or pass a different "
+                f"--demosaic ('ea' is the cv2 edge-aware fallback, measurably "
+                f"worse on edges and false colour).")
         fn = (demosaicing_CFA_Bayer_Menon2007 if method == 'menon'
               else demosaicing_CFA_Bayer_Malvar2004)
         rgb = fn(balanced.astype(np.float64), _cfa_pattern_str(pattern))
         return np.clip(np.asarray(rgb, dtype=np.float32), 0.0, 1.0)
 
-    if method != 'half' and _HAS_CV2:
+    if method == 'ea':
+        if not _HAS_CV2:
+            raise ImportError(
+                "demosaic method 'ea' needs cv2, which is not importable. "
+                "Install it with `pip install opencv-python-headless`, or pass "
+                "--demosaic half for uninterpolated half-resolution output.")
         pre   = float(np.percentile(balanced, 99.9))
         pre   = pre if pre > 1e-6 else 1.0
         u16   = (np.clip(balanced / pre, 0, 1) * 65535).astype(np.uint16)

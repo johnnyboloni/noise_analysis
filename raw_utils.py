@@ -521,6 +521,99 @@ def uniform_gain(frames, headroom: float = 1.0) -> float:
     return headroom / peak if peak > 1e-9 else 1.0
 
 
+def bayer_subplane_crop(frame: np.ndarray, size: int = 512) -> np.ndarray:
+    """
+    Centre crop of one Bayer sub-plane, float64, for registration.
+
+    A sub-plane rather than the raw mosaic: the 2x2 colour pattern is itself a
+    strong periodic signal, and correlating the mosaic directly locks onto it,
+    pinning every estimate to an even shift. One sub-plane is a plain image
+    whose sample spacing is 2 full-frame pixels, so shifts measured in it are
+    doubled to get full-frame pixels.
+    """
+    sub = frame[0::2, 0::2]
+    cy, cx = sub.shape[0] // 2, sub.shape[1] // 2
+    h = min(size, sub.shape[0]) // 2
+    w = min(size, sub.shape[1]) // 2
+    return sub[cy - h:cy + h, cx - w:cx + w].astype(np.float64)
+
+
+def phase_shift(ref_crop: np.ndarray, cur_crop: np.ndarray,
+                upsample: int = 50) -> tuple[float, float]:
+    """
+    Sub-pixel (dy, dx) that maps cur_crop onto ref_crop, in FULL-FRAME pixels.
+
+    Plain phase correlation -- normalising each cross-spectrum sample to unit
+    magnitude makes the peak depend on alignment rather than on contrast, so a
+    bright region cannot dominate the estimate -- then refined by evaluating the
+    correlation on a grid `upsample` times finer than one sample, around the
+    integer peak.
+
+    The upsampling is not a nicety. A parabolic fit through the peak and its two
+    neighbours suffers peak locking: it is biased toward whole samples and
+    reports a genuine half-pixel drift as zero (measured -- it returned 0.02 px
+    for a true 0.50 px shift, and 4.02 for a true 4.50). Half a pixel of drift
+    already costs a few percent of sharpness in the average, so an estimator
+    blind to it cannot answer the question it exists to answer. The upsampled
+    grid is evaluated with a direct matrix-multiply DFT over a +/-1 sample
+    window, which is cheap because the window is tiny.
+
+    numpy-only on purpose: registration should not add a scikit-image
+    dependency to a pass that already has every frame in hand.
+    """
+    a = ref_crop - ref_crop.mean()
+    b = cur_crop - cur_crop.mean()
+    # Hann window: the FFT treats each axis as periodic, so a scene that does
+    # not wrap seamlessly puts a bright cross of edge energy at the origin and
+    # biases every shift toward zero.
+    wy = np.hanning(a.shape[0])[:, None]
+    wx = np.hanning(a.shape[1])[None, :]
+    A = np.fft.fft2(a * wy * wx)
+    B = np.fft.fft2(b * wy * wx)
+    R = A * np.conj(B)
+    R /= np.maximum(np.abs(R), 1e-12)
+
+    ny, nx = R.shape
+    corr = np.abs(np.fft.ifft2(R))
+    py, px = np.unravel_index(int(np.argmax(corr)), corr.shape)
+    # Unwrap: a peak past the midpoint is a negative shift.
+    sy = py - ny if py > ny // 2 else py
+    sx = px - nx if px > nx // 2 else px
+
+    # Refine on a grid +/-1 sample around the integer peak, `upsample` steps per
+    # sample, by evaluating the inverse DFT directly at those offsets.
+    off = np.arange(-upsample, upsample + 1) / upsample
+    fy  = np.fft.fftfreq(ny)
+    fx  = np.fft.fftfreq(nx)
+    Ey  = np.exp(2j * np.pi * (sy + off)[:, None] * fy[None, :])
+    Ex  = np.exp(2j * np.pi * (sx + off)[:, None] * fx[None, :])
+    fine = np.abs(Ey @ R @ Ex.T)
+    iy, ix = np.unravel_index(int(np.argmax(fine)), fine.shape)
+
+    # Negated so the result is "how far cur has moved from ref", the direction
+    # a caller would shift by to undo it. x2: sub-plane samples are 2
+    # full-frame pixels apart.
+    return (-2 * (sy + off[iy]), -2 * (sx + off[ix]))
+
+
+def drift_report(shifts: np.ndarray) -> dict:
+    """
+    Summarise a per-frame (N, 2) shift series and what it costs the average.
+
+    Averaging misaligned frames convolves the result with the distribution of
+    shifts, so drift shows up as blur that no amount of extra frames removes.
+    `spread` is the RMS distance of the frames from their own centroid, which
+    is the width of that smoothing kernel; `total` is the straight-line
+    excursion from first position to last.
+    """
+    s = np.asarray(shifts, dtype=np.float64)
+    centred = s - s.mean(0)
+    spread  = float(np.sqrt((centred ** 2).sum(1).mean()))
+    total   = float(np.hypot(*(s[-1] - s[0]))) if len(s) > 1 else 0.0
+    peak    = float(np.hypot(*(s.max(0) - s.min(0))))
+    return {"spread_px": spread, "total_px": total, "excursion_px": peak}
+
+
 def highpass_std(frame: np.ndarray, pattern: np.ndarray, ksize: int = 5) -> float:
     """
     Std of the high-pass residual (frame minus a local box mean), averaged over

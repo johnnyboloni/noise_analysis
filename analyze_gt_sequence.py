@@ -14,11 +14,15 @@ Outputs (saved to OUTPUT_DIR/<sequence_name><RUN_SUFFIX>/):
                              dark-subtracted, the gain=1 still, and (with
                              ROBUST_AGGREGATORS) median and trimmed mean --
                              each written full-resolution as .npy and .dng (to
-                             feed onward) plus two PNGs to look at: _nogain
-                             (gain 1.0, the scene as calibrated) and _uniform
-                             (one gain shared across every candidate, the
-                             largest that clips nothing anywhere in the set).
-                             Both are gamma-encoded; neither is
+                             feed onward) plus three PNGs to look at: _nogain
+                             (gain 1.0, the scene as calibrated), _uniform (one
+                             gain shared across every candidate, the largest
+                             that clips nothing anywhere in the set -- use this
+                             to compare candidates), and _max (this candidate's
+                             own largest non-clipping gain, ignoring the
+                             others -- as bright as this one image alone can
+                             get, but no longer comparable to its neighbours).
+                             All three are gamma-encoded; none is
                              auto-brightened. Residual pixel noise is printed. This is the
                              only place frame data is written; there are no
                              duplicate copies at the top level.
@@ -1503,7 +1507,7 @@ def analyze_gt_sequence(
     neutral = (1.0 / np.asarray(wb, dtype=float)) if wb is not None else None
 
     def save_candidate(frame, lin_rgb, gain, base):
-        # Two PNGs per candidate, both gamma-encoded, neither auto-brightened:
+        # Three PNGs per candidate, all gamma-encoded, none auto-brightened:
         #   _nogain  -- gain 1.0, the scene exactly as calibrated. Dark for a
         #               lowlight capture, but it is the honest picture and the
         #               only one whose pixel values mean something absolute.
@@ -1511,10 +1515,22 @@ def analyze_gt_sequence(
         #               largest that clips nothing anywhere in the set. Bright
         #               enough to look at, and still comparable frame to frame:
         #               brighter here really is brighter.
+        #   _max     -- this candidate's OWN largest non-clipping gain, ignoring
+        #               every other candidate. As bright as this one image can
+        #               get without clipping -- but that breaks comparability:
+        #               if one candidate has a dimmer peak (say defect repair
+        #               removed its brightest hot pixel), its _max gain is
+        #               higher than its neighbours', so two _max PNGs sitting
+        #               side by side can look equally bright even when one
+        #               scene is genuinely dimmer. Use _uniform to compare
+        #               candidates, _max to look at just one on its own.
+        own_gain = uniform_gain([lin_rgb])
         save_rgb_png(encode_rgb(lin_rgb),
                      base.with_name(base.name + "_nogain.png"))
         save_rgb_png(encode_rgb(lin_rgb, gain=gain),
                      base.with_name(base.name + "_uniform.png"))
+        save_rgb_png(encode_rgb(lin_rgb, gain=own_gain),
+                     base.with_name(base.name + "_max.png"))
         if SAVE_NPY:
             np.save(base.with_suffix('.npy'), frame.astype(np.float32))
             print(f"Saved {base.with_suffix('.npy')}")

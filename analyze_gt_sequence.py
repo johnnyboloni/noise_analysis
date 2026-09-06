@@ -32,6 +32,12 @@ Outputs (saved to OUTPUT_DIR/<sequence_name><RUN_SUFFIX>/):
                              checkpoint, and the split-half difference at each
                              checkpoint (temporal noise alone -- scene and FPN
                              cancel in the subtraction)
+  - gt_dark_uniformity_*.png : whether the master dark is spatially flat --
+                             full resolution, block-averaged, and row/column
+                             median profiles, per-channel offset removed. The
+                             evidence for finding defects locally rather than
+                             against one global distribution (only when
+                             DARK_DIR is set)
   - gt_defect_map.png/.npy : hot/cold pixels found in the master dark
   - gt_defect_sigma_scan.png
                            : flagged fraction vs threshold, for choosing
@@ -523,6 +529,115 @@ def _dark_master_residual(paths, n_used, loader, black, white):
     b = loader(paths[1]).astype(np.float64)
     sigma1 = float((a - b).std()) / np.sqrt(2.0)
     return sigma1 / np.sqrt(n_used) / float(white - black[0])
+
+
+def _block_average(img: np.ndarray, blocks: int = 48) -> np.ndarray:
+    """
+    Downsample img to roughly `blocks` x `blocks` by averaging non-overlapping
+    tiles, dropping leftover rows/columns that do not fill a full tile.
+
+    A tile a few hundred pixels wide averages away per-pixel DSNU and drowns
+    out a handful of hot/cold pixels (they cannot move a several-hundred-pixel
+    mean by much), leaving only whatever varies smoothly across the sensor --
+    exactly the structure a local defect detector is built to see through.
+    """
+    h, w = img.shape
+    by, bx = max(1, h // blocks), max(1, w // blocks)
+    h2, w2 = (h // by) * by, (w // bx) * bx
+    return img[:h2, :w2].reshape(h2 // by, by, w2 // bx, bx).mean(axis=(1, 3))
+
+
+def _report_dark_uniformity(dark_adu, pattern, out):
+    """
+    Show whether the master dark is spatially flat, or has the smooth,
+    real structure (thermal/amp-glow gradients, column banding) that motivates
+    finding defects locally rather than against one global distribution.
+
+    Per-channel offset is removed before display: the four Bayer colours sit at
+    different levels, so an unmodified plot is a checkerboard of colour
+    offsets, not sensor structure. What's left after that is either flat
+    (uniform sensor) or shows a spatial trend (it is not).
+
+    Four panels, in increasing order of how much they average away per-pixel
+    noise and isolated defects, so smooth structure gets easier to see left to
+    right, top to bottom:
+      - full resolution, colour-clipped to the 1st/99th percentile so a few hot
+        pixels cannot wash out the scale
+      - block-averaged to ~48x48 tiles, which drowns out anything pixel-sized
+      - median per row / per column (median rather than mean so the rare
+        defect pixel cannot move it) -- a monotonic trend here IS the
+        gradient, made as simple as a single line plot.
+    """
+    centred = dark_adu.copy()
+    for r in range(2):
+        for c in range(2):
+            v = centred[r::2, c::2]
+            v -= np.median(v)
+
+    coarse = _block_average(centred)
+    row_profile = np.median(centred, axis=1)
+    col_profile = np.median(centred, axis=0)
+    lo, hi = np.percentile(centred, [1, 99])
+
+    fig, axes = plt.subplots(2, 2, figsize=(13, 11))
+
+    im0 = axes[0, 0].imshow(centred, cmap="viridis", vmin=lo, vmax=hi)
+    axes[0, 0].set_title("Full resolution\n(per-channel offset removed; "
+                         "colour range clipped to 1st/99th percentile)",
+                        fontsize=10)
+    axes[0, 0].axis("off")
+    fig.colorbar(im0, ax=axes[0, 0], fraction=0.046,
+                label="ADU above this channel's median")
+
+    im1 = axes[0, 1].imshow(coarse, cmap="viridis")
+    axes[0, 1].set_title(f"Block-averaged to {coarse.shape[1]}x{coarse.shape[0]} tiles\n"
+                         "(per-pixel noise and defects cancel out here)",
+                        fontsize=10)
+    axes[0, 1].axis("off")
+    fig.colorbar(im1, ax=axes[0, 1], fraction=0.046,
+                label="ADU above this channel's median")
+
+    axes[1, 0].plot(row_profile, linewidth=1.0, color="steelblue")
+    axes[1, 0].axhline(0, color="k", linewidth=0.7)
+    axes[1, 0].set_xlabel("row"); axes[1, 0].set_ylabel("median ADU")
+    axes[1, 0].set_title(f"Row profile  "
+                         f"(range {row_profile.max() - row_profile.min():.1f} ADU)")
+    axes[1, 0].grid(alpha=0.3)
+
+    axes[1, 1].plot(col_profile, linewidth=1.0, color="darkorange")
+    axes[1, 1].axhline(0, color="k", linewidth=0.7)
+    axes[1, 1].set_xlabel("column"); axes[1, 1].set_ylabel("median ADU")
+    axes[1, 1].set_title(f"Column profile  "
+                         f"(range {col_profile.max() - col_profile.min():.1f} ADU)")
+    axes[1, 1].grid(alpha=0.3)
+
+    fig.suptitle("Is the master dark spatially uniform?", fontsize=13, y=1.01)
+    fig.tight_layout()
+    fig.savefig(out, dpi=140, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved {out}")
+
+    struct_amp = float(coarse.max() - coarse.min())
+    dsnu = 1.4826 * float(np.median(np.abs(
+        centred - bayer_plane_median3(centred, pattern))))
+    print(f"\n  Is the master dark spatially uniform?")
+    print(f"    row range                    : "
+          f"{row_profile.max() - row_profile.min():6.1f} ADU")
+    print(f"    column range                 : "
+          f"{col_profile.max() - col_profile.min():6.1f} ADU")
+    print(f"    block-averaged span          : {struct_amp:6.1f} ADU  "
+          f"(smooth structure only -- defects and per-pixel noise cancel here)")
+    print(f"    per-pixel noise (local resid): {dsnu:6.2f} ADU")
+    if dsnu > 0 and struct_amp > 3 * dsnu:
+        print(f"    -> smooth structure is {struct_amp / dsnu:.0f}x the "
+              f"per-pixel noise: clearly not uniform.")
+        print(f"       This is exactly what the local defect detector "
+              f"subtracts out before thresholding; a single")
+        print(f"       global mean/std over the whole frame would not, "
+              f"and would inflate its own threshold by it.")
+    else:
+        print(f"    -> smooth structure is comparable to per-pixel noise "
+              f"here -- close to uniform on this dark set.")
 
 
 def _defect_map(dark_adu, pattern, resid_adu, n_sigma):
@@ -1283,6 +1398,8 @@ def analyze_gt_sequence(
         print(f"  Master dark ADU: mean={dark_adu.mean():.2f}  "
               f"min={dark_adu.min():.2f}  max={dark_adu.max():.2f}  "
               f"(black level {black[0]:.1f})")
+        _report_dark_uniformity(dark_adu, pattern,
+                                seq_out / f"gt_dark_uniformity_N{d_stack}.png")
         dark_corrected = _dark_correct(full_mean_adu, dark_adu, pattern, black, white)
 
         hp_before = highpass_std(full_mean, pattern)

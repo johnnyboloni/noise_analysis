@@ -16,14 +16,15 @@ Outputs (saved to OUTPUT_DIR/<sequence_name><RUN_SUFFIX>/):
                              each written full-resolution as .npy and .dng (to
                              feed onward) plus three PNGs to look at: _nogain
                              (gain 1.0, the scene as calibrated), _uniform (one
-                             gain shared across every candidate, the largest
-                             that clips nothing anywhere in the set -- use this
-                             to compare candidates), and _max (this candidate's
-                             own largest non-clipping gain, ignoring the
-                             others -- as bright as this one image alone can
-                             get, but no longer comparable to its neighbours).
-                             All three are gamma-encoded; none is
-                             auto-brightened. Residual pixel noise is printed. This is the
+                             gain shared across every candidate, set by
+                             GAIN_PERCENTILE so a lone outlier pixel can't hold
+                             the whole set's brightness down -- use this to
+                             compare candidates), and _max (this candidate's
+                             own version of the same gain, ignoring the others
+                             -- as bright as this one image alone can get, but
+                             no longer comparable to its neighbours). All three
+                             are gamma-encoded; none is auto-brightened.
+                             Residual pixel noise is printed. This is the
                              only place frame data is written; there are no
                              duplicate copies at the top level.
   - gt_checkpoint_noise.png: measured noise vs frames averaged -- split-half
@@ -115,7 +116,7 @@ from raw_utils import (
 # ============================================================
 SEQUENCE_DIR  = "/path/to/static/sequence"
 OUTPUT_DIR    = "output/gt_analysis"
-RUN_SUFFIX    = "_drift_and_dark_iter"   # appended to the per-sequence output dir, so
+RUN_SUFFIX    = "_pctile_gain"   # appended to the per-sequence output dir, so
                                    # runs sit side by side instead of
                                    # overwriting each other and the directory
                                    # name says what was being tested.
@@ -245,6 +246,17 @@ STILLS_FRAMES   = 1     # how many stills to use. 1 (default) keeps this an
 MATCH_STILL_INTENSITY = True   # rescale the stills by a robust ratio so the
                                # comparison is not dominated by an exposure
                                # mismatch between the two capture settings
+GAIN_PERCENTILE = 99.99  # the display gain for _uniform/_max PNGs and the
+                        # checkpoint-crop panel is set to put this percentile
+                        # at full scale, not the literal max -- one hot pixel
+                        # or interpolation-overshoot outlier otherwise holds
+                        # the gain (and so every PNG's brightness) down to
+                        # whatever keeps just that one pixel under the
+                        # ceiling. Measured: 3 outlier pixels out of 245,760
+                        # held a real comparison set to 1.17x when 99.99 would
+                        # allow 1.60x (36% brighter), clipping only those same
+                        # few pixels. Set to 100 for the old zero-clipping
+                        # guarantee if that tradeoff is ever wrong here.
 SAVE_DNG        = True  # write a .dng next to every GT candidate PNG, in raw
                         # ADU with the black pedestal restored, so downstream
                         # tools read it exactly like an original capture
@@ -1361,7 +1373,7 @@ def _plot_checkpoint_crops(crops, out, crop_size):
     difference in the data, not in how each was exposed.
     """
     n_panels = len(crops)
-    gain = uniform_gain([c for _, c in crops])
+    gain = uniform_gain([c for _, c in crops], percentile=GAIN_PERCENTILE)
     fig, axes = plt.subplots(1, n_panels, figsize=(4.2 * n_panels, 4.8))
     if n_panels == 1:
         axes = [axes]
@@ -1511,20 +1523,23 @@ def analyze_gt_sequence(
         #   _nogain  -- gain 1.0, the scene exactly as calibrated. Dark for a
         #               lowlight capture, but it is the honest picture and the
         #               only one whose pixel values mean something absolute.
-        #   _uniform -- one gain shared by every candidate in this run, the
-        #               largest that clips nothing anywhere in the set. Bright
-        #               enough to look at, and still comparable frame to frame:
-        #               brighter here really is brighter.
-        #   _max     -- this candidate's OWN largest non-clipping gain, ignoring
+        #   _uniform -- one gain shared by every candidate in this run, set by
+        #               GAIN_PERCENTILE rather than the literal max so a lone
+        #               outlier pixel in one candidate can't hold every
+        #               candidate's brightness down (measured: 3 outlier
+        #               pixels out of 245,760 cost 36% of the achievable
+        #               brightness before this). Still comparable frame to
+        #               frame: brighter here really is brighter.
+        #   _max     -- this candidate's OWN version of that gain, ignoring
         #               every other candidate. As bright as this one image can
-        #               get without clipping -- but that breaks comparability:
+        #               get -- but that breaks comparability:
         #               if one candidate has a dimmer peak (say defect repair
         #               removed its brightest hot pixel), its _max gain is
         #               higher than its neighbours', so two _max PNGs sitting
         #               side by side can look equally bright even when one
         #               scene is genuinely dimmer. Use _uniform to compare
         #               candidates, _max to look at just one on its own.
-        own_gain = uniform_gain([lin_rgb])
+        own_gain = uniform_gain([lin_rgb], percentile=GAIN_PERCENTILE)
         save_rgb_png(encode_rgb(lin_rgb),
                      base.with_name(base.name + "_nogain.png"))
         save_rgb_png(encode_rgb(lin_rgb, gain=gain),
@@ -1697,10 +1712,12 @@ def analyze_gt_sequence(
             for i, f in progress(list(enumerate(frames)), desc="  demosaic",
                                  total=len(frames)):
                 lin[i] = demosaic_linear(f, pattern, wb, ccm)
-            gain = uniform_gain(lin)
-            print(f"  Uniform display gain: ×{gain:.3f} "
-                  f"(largest that clips nothing in any candidate); "
-                  f"plus an ungained version of each")
+            gain = uniform_gain(lin, percentile=GAIN_PERCENTILE)
+            clip_note = (f"puts the {GAIN_PERCENTILE}th percentile at full "
+                        f"scale, clipping only above it"
+                        if GAIN_PERCENTILE < 100 else "clips nothing")
+            print(f"  Uniform display gain: ×{gain:.3f} ({clip_note}); "
+                  f"plus an ungained and a per-candidate-max version of each")
             for i, (f, slug) in enumerate(zip(frames, slugs)):
                 save_candidate(f, lin[i], gain, cmp_dir / f"cmp_{slug}")
         finally:

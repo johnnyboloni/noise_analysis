@@ -24,7 +24,12 @@ Outputs (saved to OUTPUT_DIR/<dark_dir_name>/):
                             guess or rerun with different counts.
   - defect_sigma_scan.png : excess-over-chance table for choosing
                             HOT_PIXEL_SIGMA, and the residual histogram
-                            against a Gaussian reference
+                            against a Gaussian reference (DEFECT_METHOD picks
+                            "local" (default) or "global" -- global is only
+                            valid once dark_uniformity.png's ratio is
+                            confirmed well under 3x; local vs global land in
+                            separate output dirs so they can be compared
+                            directly)
   - defect_map.png/.npy   : hot/cold pixels found at the current
                             HOT_PIXEL_SIGMA (only if any are flagged)
 """
@@ -57,6 +62,9 @@ GN3_BLACK_LEVEL  = 256   # GN3 has no black-level metadata; DNG ignores this
 DARK_MAX_FRAMES  = None  # cap the darks used, None = every frame found
 DARK_SIGMA_CLIP  = 4.0   # see analyze_gt_sequence.py's DARK_SIGMA_CLIP comment
 HOT_PIXEL_SIGMA  = 5.0   # see analyze_gt_sequence.py's HOT_PIXEL_SIGMA comment
+DEFECT_METHOD    = "local"  # see analyze_gt_sequence.py's DEFECT_METHOD comment
+                            # -- "global" is only valid once dark_uniformity's
+                            # ratio is confirmed well under 3x
 DEFECT_FRAC_WARN = 0.005 # warn once the defect map exceeds this fraction
 LOAD_WORKERS     = 4     # threads used to decode dark frames ahead of the pass
 
@@ -143,7 +151,11 @@ def main():
     n = len(paths)
     print(f"  {n} {fmt.upper()} frames  |  white={white}  black={black[0]}")
 
-    out_dir = Path(OUTPUT_DIR) / Path(DARK_DIR).name
+    # A global-method run is a different experiment from local, so it gets its
+    # own directory rather than silently overwriting the other's result --
+    # exactly what comparing the two methods needs.
+    dmethod = f"_defect{DEFECT_METHOD}" if DEFECT_METHOD != "local" else ""
+    out_dir = Path(OUTPUT_DIR) / (Path(DARK_DIR).name + dmethod)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     n_want = DARK_MAX_FRAMES or n
@@ -172,10 +184,11 @@ def main():
     if HOT_PIXEL_SIGMA:
         resid_adu = resid * float(white - black[0])
         mask, n_hot, n_cold = gt_seq._defect_map(dark_adu, pattern, resid_adu,
-                                                 HOT_PIXEL_SIGMA)
+                                                 HOT_PIXEL_SIGMA, method=DEFECT_METHOD)
         frac = mask.mean() * 100
-        print(f"\nDefect map (>{HOT_PIXEL_SIGMA}σ from same-colour "
-              f"neighbours in the master dark): "
+        print(f"\nDefect map ({DEFECT_METHOD}, >{HOT_PIXEL_SIGMA}σ"
+              f"{' from same-colour neighbours' if DEFECT_METHOD == 'local' else ''} "
+              f"in the master dark): "
               f"{n_hot} hot, {n_cold} cold, {frac:.4f}% of pixels")
         if frac > DEFECT_FRAC_WARN * 100:
             print(f"  WARNING: that is a lot of pixels to interpolate. Each one "
@@ -186,7 +199,7 @@ def main():
                   f"{DEFECT_FRAC_WARN * 100:.2f}%.")
         gt_seq._defect_sigma_scan(dark_adu, pattern,
                                   out_dir / "defect_sigma_scan.png",
-                                  HOT_PIXEL_SIGMA)
+                                  HOT_PIXEL_SIGMA, method=DEFECT_METHOD)
         if mask.any():
             gt_seq._plot_defect_map(mask, n_hot, n_cold, out_dir / "defect_map.png")
             np.save(out_dir / "defect_map.npy", mask)

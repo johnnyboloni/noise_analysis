@@ -38,7 +38,12 @@ Outputs (saved to OUTPUT_DIR/<sequence_name><RUN_SUFFIX>/):
                              evidence for finding defects locally rather than
                              against one global distribution (only when
                              DARK_DIR is set)
-  - gt_defect_map.png/.npy : hot/cold pixels found in the master dark
+  - gt_defect_map.png/.npy : hot/cold pixels found in the master dark, via
+                             DEFECT_METHOD ("local" (default) or "global" --
+                             global is only valid once gt_dark_uniformity's
+                             ratio is confirmed well under 3x; local vs global
+                             land in separate output dirs so they can be
+                             compared directly)
   - gt_defect_sigma_scan.png
                            : flagged fraction vs threshold, for choosing
                              HOT_PIXEL_SIGMA (only when DARK_DIR is set)
@@ -163,6 +168,17 @@ DARK_SIGMA_CLIP = 4.0   # reject dark samples beyond this many sigma from the
 HOT_PIXEL_SIGMA = 5.0   # flag master-dark pixels this many residual-sigma from
                         # their same-colour neighbours as defects, and repair
                         # them by interpolation. 0 or None = skip.
+DEFECT_METHOD   = "local"  # "local" (default) subtracts a same-colour local
+                        # median before thresholding, so real sensor structure
+                        # (gradients, banding, channel offsets) isn't mistaken
+                        # for defects. "global" skips that and thresholds the
+                        # raw master dark per sub-plane -- only valid once
+                        # gt_dark_uniformity's block-averaged-span/per-pixel-
+                        # noise ratio is confirmed well under the 3x it warns
+                        # at; measured at 0x/0.4x/6x that ratio, global matches
+                        # local (and has fewer false positives) below ~1x but
+                        # its recall collapses to 78.6% by 6x while local holds
+                        # at 100%. See _defect_map's docstring for the numbers.
 LOAD_WORKERS    = 4     # threads used to decode frames ahead of the accumulator.
                         # rawpy releases the GIL around LibRaw's decode, so
                         # threads give real parallelism here (measured ~3x at 4
@@ -640,35 +656,41 @@ def _report_dark_uniformity(dark_adu, pattern, out):
               f"here -- close to uniform on this dark set.")
 
 
-def _defect_map(dark_adu, pattern, resid_adu, n_sigma):
+def _defect_map(dark_adu, pattern, resid_adu, n_sigma, method='local'):
     """
     Locate defective pixels in the master dark.
 
-    Two ingredients, and both are needed:
+    method='local' (default): subtract a local same-colour median first, then
+    threshold the residual. The subtraction removes everything a sensor has
+    which is real but not a defect -- thermal/amp-glow gradients, column FPN,
+    per-channel level offsets -- so only pixels standing out from their
+    immediate surroundings survive. A purely global threshold cannot do this:
+    on a dark with a 40 ADU thermal gradient it collapses to 9% recall,
+    because the gradient inflates the spread it measures.
 
-    Subtract a local same-colour median first. That removes everything a sensor
-    has which is real but not a defect -- thermal/amp-glow gradients, column
-    FPN, per-channel level offsets -- so only pixels standing out from their
-    immediate surroundings survive. A purely global threshold cannot do this: on
-    a dark with a 40 ADU thermal gradient it collapses to 9% recall, because the
-    gradient inflates the spread it measures.
+    method='global': threshold the raw master dark directly, per sub-plane,
+    with no local subtraction. Only correct once _report_dark_uniformity has
+    confirmed the master has no structure worth protecting against -- measured
+    at the ratio (block-averaged span / per-pixel noise) that call reports:
 
-    Then set the threshold from the MAD of that residual, per sub-plane, rather
-    than from the master dark's own noise. This is the part that was wrong
-    before: the residual is dominated by ordinary DSNU spread (pixel-to-pixel
-    variation that is normal, not defective), which is several times the
-    master's read-noise residual. Thresholding at k x residual-noise therefore
-    cut deep into the healthy population -- measured on a synthetic dark with a
-    true 0.2% defect rate, it flagged 0.58-0.70% of pixels, i.e. roughly two
-    thirds of the map were healthy pixels being needlessly interpolated. Taking
-    the scale from the data instead gives 0.19-0.21%.
+        ratio    global recall   local recall   global false-pos   local false-pos
+        ~0x            100.0%         100.0%                  0               167
+        ~0.4x          100.0%         100.0%                  0               140
+        ~6x             78.6%         100.0%                  0               159
 
-    Measured recall / false positives at 5 sigma across four dark types
-    (uniform, thermal gradient, column FPN, channel offsets):
+    global matches local (and has fewer false positives) below roughly 1x, but
+    degrades as the ratio grows and local does not move. Below the check,
+    global is a strictly worse bet than checking once and using local always;
+    above it, global is silently wrong. Use it only to compare against local on
+    data already confirmed uniform, not as a default.
 
-        global only     95.7 / 9.2 / 75.8 / 95.5 %      0-1 false positives
-        k * resid       99.6 / 99.2 / 99.2 / 99.8 %   1013-1319 false positives
-        this method     96.8 / 96.6 / 96.1 / 97.0 %      4-38 false positives
+    Either way, the threshold comes from the MAD of the (local or raw) residual,
+    per sub-plane, rather than from the master dark's own read-noise residual --
+    that residual is dominated by ordinary DSNU spread (pixel-to-pixel variation
+    that is normal, not defective), several times larger, and thresholding at
+    k x residual-noise cuts deep into the healthy population (measured: 0.58-
+    0.70% flagged against a true 0.2% rate). Taking the scale from the data
+    instead (either method) gives 0.19-0.21%.
 
     resid_adu is still accepted and reported by the caller as a quality figure
     for the master dark, but no longer sets the threshold.
@@ -676,7 +698,12 @@ def _defect_map(dark_adu, pattern, resid_adu, n_sigma):
     Returns (mask, n_hot, n_cold). Cold (stuck-low) pixels are flagged too;
     they are equally wrong in the output and cost nothing extra to find.
     """
-    dev  = dark_adu - bayer_plane_median3(dark_adu, pattern)
+    if method == 'local':
+        dev = dark_adu - bayer_plane_median3(dark_adu, pattern)
+    elif method == 'global':
+        dev = dark_adu
+    else:
+        raise ValueError(f"unknown defect method {method!r}; expected 'local' or 'global'")
     hot  = np.zeros(dark_adu.shape, dtype=bool)
     cold = np.zeros(dark_adu.shape, dtype=bool)
     for r in range(2):
@@ -694,7 +721,7 @@ def _defect_map(dark_adu, pattern, resid_adu, n_sigma):
     return (hot | cold), int(hot.sum()), int(cold.sum())
 
 
-def _defect_sigma_scan(dark_adu, pattern, out, current_sigma):
+def _defect_sigma_scan(dark_adu, pattern, out, current_sigma, method='local'):
     """
     Show where real defects start, so HOT_PIXEL_SIGMA can be chosen from data.
 
@@ -712,10 +739,21 @@ def _defect_sigma_scan(dark_adu, pattern, out, current_sigma):
     The histogram shows the same thing continuously -- the residual in sigma
     units against a Gaussian reference. Where the measured tail lifts off the
     curve is where defects begin.
+
+    `method` must match whatever _defect_map is being tuned for ('local'
+    subtracts a local same-colour median first, 'global' does not) -- the
+    scan has to measure the same residual the threshold will actually be
+    applied to, or the table answers a different question than the one being
+    asked.
     """
     from math import erfc, sqrt as _sqrt
 
-    dev = dark_adu - bayer_plane_median3(dark_adu, pattern)
+    if method == 'local':
+        dev = dark_adu - bayer_plane_median3(dark_adu, pattern)
+    elif method == 'global':
+        dev = dark_adu
+    else:
+        raise ValueError(f"unknown defect method {method!r}; expected 'local' or 'global'")
     z   = np.zeros_like(dev, dtype=np.float32)
     for r in range(2):
         for c in range(2):
@@ -1244,10 +1282,13 @@ def analyze_gt_sequence(
     Saves outputs to out_dir/<sequence_name>/ (see module docstring).
     """
     seq_name = Path(directory).name
-    # A capped run is a different experiment from a full one, so it gets its own
-    # directory rather than silently overwriting the full result.
+    # A capped run is a different experiment from a full one, and a global-
+    # defect-method run a different one from local, so each gets its own
+    # directory rather than silently overwriting the other's result -- exactly
+    # what comparing the two methods needs.
     cap      = f"_max{max_frames}" if max_frames else ""
-    seq_out  = out_dir / (seq_name + (RUN_SUFFIX or "") + cap)
+    dmethod  = f"_defect{DEFECT_METHOD}" if DEFECT_METHOD != "local" else ""
+    seq_out  = out_dir / (seq_name + (RUN_SUFFIX or "") + cap + dmethod)
     seq_out.mkdir(parents=True, exist_ok=True)
 
     rev = git_revision()
@@ -1424,10 +1465,11 @@ def analyze_gt_sequence(
         if HOT_PIXEL_SIGMA and resid is not None:
             resid_adu = resid * float(white - black[0])
             mask, n_hot, n_cold = _defect_map(dark_adu, pattern, resid_adu,
-                                              HOT_PIXEL_SIGMA)
+                                              HOT_PIXEL_SIGMA, method=DEFECT_METHOD)
             frac = mask.mean() * 100
-            print(f"\n  Defect map (>{HOT_PIXEL_SIGMA}σ from same-colour "
-                  f"neighbours in the master dark): "
+            print(f"\n  Defect map ({DEFECT_METHOD}, >{HOT_PIXEL_SIGMA}σ"
+                  f"{' from same-colour neighbours' if DEFECT_METHOD == 'local' else ''} "
+                  f"in the master dark): "
                   f"{n_hot} hot, {n_cold} cold, {frac:.4f}% of pixels")
             if frac > DEFECT_FRAC_WARN * 100:
                 # Every flagged pixel is guessed from its neighbours, and a guess
@@ -1442,7 +1484,7 @@ def analyze_gt_sequence(
                       f"{DEFECT_FRAC_WARN * 100:.2f}%.")
             _defect_sigma_scan(dark_adu, pattern,
                                seq_out / "gt_defect_sigma_scan.png",
-                               HOT_PIXEL_SIGMA)
+                               HOT_PIXEL_SIGMA, method=DEFECT_METHOD)
             if mask.any():
                 _plot_defect_map(mask, n_hot, n_cold,
                                  seq_out / "gt_defect_map.png")

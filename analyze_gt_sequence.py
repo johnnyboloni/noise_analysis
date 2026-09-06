@@ -47,12 +47,16 @@ Outputs (saved to OUTPUT_DIR/<sequence_name><RUN_SUFFIX>/):
   - gt_defect_sigma_scan.png
                            : flagged fraction vs threshold, for choosing
                              HOT_PIXEL_SIGMA (only when DARK_DIR is set)
-  - gt_drift_*.png         : per-frame position over the run and the path it
-                             traced, from phase correlation on a Bayer
-                             sub-plane crop. Averaging misaligned frames
-                             convolves the result with the spread of positions,
-                             so drift is blur that more frames cannot remove --
-                             the first thing to check when the GT looks soft.
+  - gt_drift_*.png         : per-frame position over the run, the path it
+                             traced, and the distribution of drift magnitudes,
+                             from phase correlation on a Bayer sub-plane crop.
+                             Averaging misaligned frames convolves the result
+                             with the spread of positions, so drift is blur
+                             that more frames cannot remove -- the first thing
+                             to check when the GT looks soft. MAX_DRIFT_PX
+                             excludes any frame past it from every accumulator
+                             (mean, split-half, stationarity); excluded frames
+                             are marked on all three panels.
   - gt_stationarity_*.png  : frame level over the run, plus a first-half vs
                              second-half check. Averaging assumes every frame
                              shows the same thing; if the sensor warmed or the
@@ -205,6 +209,14 @@ DRIFT_WARN_PX   = 0.5   # warn once the RMS spread of frame positions exceeds
                         # floor (~0.3 px, inherent to registering an aliased
                         # Bayer sub-plane -- verified to match scikit-image's
                         # phase_cross_correlation to within 0.01 px).
+MAX_DRIFT_PX    = None  # exclude frames whose shift vs frame 0 exceeds this
+                        # many pixels from every accumulator (mean, split-half,
+                        # stationarity) -- forces drift measurement on even if
+                        # MEASURE_DRIFT is False. None = keep every frame.
+                        # Don't set this near or below the ~0.3 px estimator
+                        # floor above -- it can't tell real sub-floor drift
+                        # from its own noise, so a threshold that low would
+                        # drop frames at random rather than for cause.
 DEMOSAIC        = "menon"   # demosaic used for the PNG previews and comparison
                             # crops (the DNG/NPY ground truth stays in the Bayer
                             # domain and is never demosaiced). "menon" (DDFAPD)
@@ -275,12 +287,20 @@ def _stream_mean(paths, pattern, black, white, loader,
     Accumulates raw ADU in float64 so sub-black noise cancels across frames,
     then calibrates (and clips) the final mean once.
 
-    If `checkpoints` (a set of 1-based frame counts) and `on_checkpoint` are
-    given, the running mean is calibrated and handed to on_checkpoint(idx, frame)
-    as each count is reached -- letting the caller save intermediate averages
-    without a second pass. The callback is expected to consume the frame
-    immediately (save it / keep a crop) rather than retain it, so peak memory
-    stays at one frame regardless of how many checkpoints are requested.
+    If `checkpoints` (a set of 1-based positions in the input sequence) and
+    `on_checkpoint` are given, the running mean is calibrated and handed to
+    on_checkpoint(n_used, frame) once processing reaches each position --
+    letting the caller save intermediate averages without a second pass. The
+    callback is expected to consume the frame immediately (save it / keep a
+    crop) rather than retain it, so peak memory stays at one frame regardless
+    of how many checkpoints are requested. `n_used` is frames actually
+    averaged so far, not the checkpoint's nominal position -- they differ once
+    MAX_DRIFT_PX has excluded any frames.
+
+    MAX_DRIFT_PX (module config) excludes any frame whose measured drift vs
+    frame 0 exceeds it from every accumulator here -- mean, split-half,
+    stationarity alike -- so a few frames a camera bump moved do not blur the
+    average that no later frame count can undo. See gt_drift_*.png.
 
     Frames are accumulated in two disjoint halves (even- and odd-indexed) rather
     than one running sum, which costs one extra float64 accumulator but enables
@@ -311,13 +331,67 @@ def _stream_mean(paths, pattern, black, white, loader,
     # Registration rides this pass: every frame is already decoded here, and the
     # correlation runs on a 512x512 crop of one Bayer sub-plane, so measuring
     # drift costs ~35 ms a frame rather than a whole extra read of the sequence.
+    # MAX_DRIFT_PX needs a shift for every frame before deciding whether to
+    # keep it, so it forces measurement on even when MEASURE_DRIFT is False.
+    measure_drift = bool(MEASURE_DRIFT) or (MAX_DRIFT_PX is not None)
     ref_crop = None
     shifts   = []
+    n_dropped = 0
+    fired_final = False
+
+    def _fire_checkpoint(n_used):
+        total   = acc_e if acc_o is None else acc_e + acc_o
+        running = calibrate_frame((total / n_used).astype(np.float32),
+                                  pattern, black, white)
+        del total          # free before the split-half diff allocates
+        # Split-half difference, in calibrated units. The scene and any
+        # fixed-pattern noise are identical in both halves and cancel exactly,
+        # so this is a picture of the temporal noise alone -- the only
+        # component averaging can remove. Computed once and reused for both
+        # the metric and the saved image.
+        if n_o > 0:
+            half_diff = ((acc_e / n_e) - (acc_o / n_o)).astype(np.float32)
+            half_diff /= float(white - black[0])
+        else:
+            half_diff = None          # N=1: no second half to compare
+        metrics.append(_checkpoint_metrics(n_used, half_diff, n_e, n_o,
+                                           running, pattern))
+        if on_checkpoint is not None:
+            on_checkpoint(n_used, running, half_diff)
 
     for i, (p, frame) in enumerate(progress(
             prefetch(paths, loader, LOAD_WORKERS), desc="  mean", total=n)):
         idx = i + 1
         raw = frame.astype(np.float64)
+
+        # Drift is measured for every frame -- including ones about to be
+        # dropped -- because gt_drift_*.png needs the full record to show what
+        # got excluded and why, not just what survived.
+        mag = None
+        if measure_drift:
+            crop = bayer_subplane_crop(frame, DRIFT_CROP)
+            if ref_crop is None:
+                ref_crop = crop
+            shift = phase_shift(ref_crop, crop)
+            shifts.append(shift)
+            mag = float(np.hypot(*shift))
+
+        frame_levels.append(float(raw.mean()))
+
+        if MAX_DRIFT_PX is not None and mag is not None and mag > MAX_DRIFT_PX:
+            n_dropped += 1
+            continue    # excluded from every accumulator below, including the
+                        # stationarity ones -- they should reflect the same
+                        # frames that actually go into the mean. An
+                        # intermediate checkpoint landing on a dropped frame is
+                        # simply skipped (a slightly sparser convergence curve,
+                        # harmless); the FINAL one is not -- see below, it's
+                        # forced after the loop if it never fired here, because
+                        # a monotonic drift makes the last frames the likeliest
+                        # to be dropped, and skipping the final checkpoint would
+                        # silently truncate the one number (the actual result)
+                        # that must never go missing.
+
         if i % 2 == 0:
             acc_e = raw if acc_e is None else acc_e + raw
             n_e += 1
@@ -325,49 +399,42 @@ def _stream_mean(paths, pattern, black, white, loader,
             acc_o = raw if acc_o is None else acc_o + raw
             n_o += 1
 
-        frame_levels.append(float(raw.mean()))
-        if MEASURE_DRIFT:
-            crop = bayer_subplane_crop(frame, DRIFT_CROP)
-            if ref_crop is None:
-                ref_crop = crop
-            shifts.append(phase_shift(ref_crop, crop))
         dec = raw[::DEC, ::DEC]
         for key in ('e' if i % 2 == 0 else 'o', 'f1' if i < half else 'f2'):
             dec_acc[key] = dec.copy() if dec_acc[key] is None else dec_acc[key] + dec
             dec_n[key] += 1
 
-        if idx in checkpoints:
-            total   = acc_e if acc_o is None else acc_e + acc_o
-            running = calibrate_frame((total / idx).astype(np.float32),
-                                      pattern, black, white)
-            del total          # free before the split-half diff allocates
-
-            # Split-half difference, in calibrated units. The scene and any
-            # fixed-pattern noise are identical in both halves and cancel
-            # exactly, so this is a picture of the temporal noise alone --
-            # the only component averaging can remove. Computed once and
-            # reused for both the metric and the saved image.
-            if n_o > 0:
-                half_diff = ((acc_e / n_e) - (acc_o / n_o)).astype(np.float32)
-                half_diff /= float(white - black[0])
-            else:
-                half_diff = None          # N=1: no second half to compare
-
-            metrics.append(_checkpoint_metrics(idx, half_diff, n_e, n_o,
-                                               running, pattern))
-            if on_checkpoint is not None:
-                on_checkpoint(idx, running, half_diff)
-            del running, half_diff
+        n_used = n_e + n_o
+        if idx in checkpoints and n_used > 0:
+            _fire_checkpoint(n_used)
+            if idx == n:
+                fired_final = True
     print()
 
+    n_used = n_e + n_o
+    if n_used == 0:
+        sys.exit(f"MAX_DRIFT_PX={MAX_DRIFT_PX} excluded all {n} frames -- "
+                 f"nothing left to average. Raise it.")
+    if n_dropped:
+        print(f"  Dropped {n_dropped}/{n} frames ({100 * n_dropped / n:.1f}%) "
+              f"beyond MAX_DRIFT_PX={MAX_DRIFT_PX} px drift")
+    if n in checkpoints and not fired_final:
+        # The nominal final position (idx == n) landed on a dropped frame, so
+        # the checkpoint that should represent the actual result never fired
+        # in the loop above -- fire it now with the true final n_used. Guarded
+        # on `n in checkpoints` so this never fires a checkpoint the caller
+        # never asked for.
+        _fire_checkpoint(n_used)
+
     total    = acc_e if acc_o is None else acc_e + acc_o
-    mean_adu = (total / n).astype(np.float32)
+    mean_adu = (total / n_used).astype(np.float32)
     # The raw-ADU mean is returned alongside the calibrated one because dark
     # subtraction has to happen before black-level removal (see _dark_correct).
     stationarity = {'dec_acc': dec_acc, 'dec_n': dec_n,
                     'levels': np.array(frame_levels, dtype=np.float64),
                     'shifts': (np.array(shifts, dtype=np.float64)
-                               if shifts else None)}
+                               if shifts else None),
+                    'n_dropped': n_dropped}
     return (calibrate_frame(mean_adu, pattern, black, white), mean_adu,
             metrics, stationarity)
 
@@ -1057,7 +1124,7 @@ def _report_floor(metrics, margins=(3.0, 5.0)):
     print()
 
 
-def _report_drift(shifts, out):
+def _report_drift(shifts, out, max_drift_px=None):
     """
     Per-frame position over the run, and what its spread costs the average.
 
@@ -1071,10 +1138,26 @@ def _report_drift(shifts, out):
     which inflates the spread; a spread at or under that is consistent with a
     perfectly static sequence, so the printed verdict is deliberately cautious
     below DRIFT_WARN_PX.
+
+    `shifts` is the full per-frame record, including any frame MAX_DRIFT_PX
+    (`max_drift_px` here) went on to exclude from the actual average -- the
+    verdict and the "spread" quoted in the path panel are computed on the KEPT
+    frames only (what's actually blurring the result), while every panel plots
+    the full record with excluded frames marked, so it is visible what got cut
+    and why.
     """
-    d = drift_report(shifts)
+    mag     = np.hypot(shifts[:, 0], shifts[:, 1])
+    dropped = (mag > max_drift_px) if max_drift_px is not None else np.zeros(len(mag), bool)
+    kept    = shifts[~dropped]
+
+    d = drift_report(kept if len(kept) else shifts)
     print("\n  Frame-to-frame drift (registration on a Bayer sub-plane crop)")
-    print(f"    RMS spread about the centroid : {d['spread_px']:.2f} px")
+    if max_drift_px is not None:
+        print(f"    excluded (> {max_drift_px} px)        : "
+              f"{int(dropped.sum())}/{len(mag)}  "
+              f"({100 * dropped.mean():.1f}%)")
+    print(f"    RMS spread about the centroid : {d['spread_px']:.2f} px"
+          + ("  (kept frames only)" if dropped.any() else ""))
     print(f"    first frame to last           : {d['total_px']:.2f} px")
     print(f"    largest excursion             : {d['excursion_px']:.2f} px")
     # Blur from averaging over a spread s is roughly a Gaussian of that width;
@@ -1091,20 +1174,44 @@ def _report_drift(shifts, out):
         print(f"       If the frame still looks soft, the cause is upstream "
               f"(focus, motion blur within a frame, optics), not the averaging.")
 
-    fig, axes = plt.subplots(1, 2, figsize=(13, 4.6))
-    axes[0].plot(shifts[:, 1], linewidth=0.9, label="x (col)")
-    axes[0].plot(shifts[:, 0], linewidth=0.9, label="y (row)")
+    fig, axes = plt.subplots(1, 3, figsize=(19, 4.6))
+    idx = np.arange(len(shifts))
+    axes[0].plot(idx, shifts[:, 1], linewidth=0.9, label="x (col)")
+    axes[0].plot(idx, shifts[:, 0], linewidth=0.9, label="y (row)")
+    if dropped.any():
+        axes[0].scatter(idx[dropped], shifts[dropped, 1], s=14, c="crimson",
+                        zorder=3, label="excluded")
+        axes[0].scatter(idx[dropped], shifts[dropped, 0], s=14, c="crimson",
+                        zorder=3)
     axes[0].axhline(0, color="k", linewidth=0.8)
     axes[0].set_xlabel("frame"); axes[0].set_ylabel("shift vs frame 0 (px)")
     axes[0].set_title("Drift over the run"); axes[0].legend(fontsize=9)
     axes[0].grid(alpha=0.3)
+
     axes[1].plot(shifts[:, 1], shifts[:, 0], linewidth=0.7, alpha=0.8)
-    axes[1].scatter(*shifts[0, ::-1], s=40, c="seagreen", zorder=3, label="first")
-    axes[1].scatter(*shifts[-1, ::-1], s=40, c="crimson", zorder=3, label="last")
+    if dropped.any():
+        axes[1].scatter(shifts[dropped, 1], shifts[dropped, 0], s=14,
+                        c="crimson", zorder=3, label="excluded")
+    axes[1].scatter(*shifts[0, ::-1], s=40, c="seagreen", zorder=4, label="first")
+    axes[1].scatter(*shifts[-1, ::-1], s=40, c="darkorange", zorder=4, label="last")
     axes[1].set_xlabel("x shift (px)"); axes[1].set_ylabel("y shift (px)")
-    axes[1].set_title(f"Path  (RMS spread {d['spread_px']:.2f} px)")
+    axes[1].set_title(f"Path  (RMS spread {d['spread_px']:.2f} px"
+                      f"{', kept only' if dropped.any() else ''})")
     axes[1].set_aspect("equal", adjustable="datalim")
     axes[1].legend(fontsize=9); axes[1].grid(alpha=0.3)
+
+    axes[2].hist(mag, bins=min(40, max(10, len(mag) // 3)),
+                color="steelblue", alpha=0.85, label="all frames")
+    axes[2].axvline(DRIFT_WARN_PX, color="gray", linestyle="--", linewidth=1.2,
+                    label=f"estimator floor ({DRIFT_WARN_PX} px)")
+    if max_drift_px is not None:
+        axes[2].axvline(max_drift_px, color="crimson", linewidth=1.4,
+                        label=f"MAX_DRIFT_PX ({max_drift_px} px)")
+    axes[2].set_xlabel("drift magnitude vs frame 0 (px)")
+    axes[2].set_ylabel("frames")
+    axes[2].set_title("Drift magnitude distribution")
+    axes[2].legend(fontsize=9); axes[2].grid(alpha=0.3)
+
     fig.tight_layout()
     fig.savefig(out, dpi=130, bbox_inches="tight")
     plt.close(fig)
@@ -1288,7 +1395,8 @@ def analyze_gt_sequence(
     # what comparing the two methods needs.
     cap      = f"_max{max_frames}" if max_frames else ""
     dmethod  = f"_defect{DEFECT_METHOD}" if DEFECT_METHOD != "local" else ""
-    seq_out  = out_dir / (seq_name + (RUN_SUFFIX or "") + cap + dmethod)
+    dmax     = f"_maxdrift{MAX_DRIFT_PX}" if MAX_DRIFT_PX is not None else ""
+    seq_out  = out_dir / (seq_name + (RUN_SUFFIX or "") + cap + dmethod + dmax)
     seq_out.mkdir(parents=True, exist_ok=True)
 
     rev = git_revision()
@@ -1362,7 +1470,8 @@ def analyze_gt_sequence(
     _report_stationarity(stationarity, white, black,
                          seq_out / f"gt_stationarity_N{n}.png")
     if stationarity.get('shifts') is not None:
-        _report_drift(stationarity['shifts'], seq_out / f"gt_drift_N{n}.png")
+        _report_drift(stationarity['shifts'], seq_out / f"gt_drift_N{n}.png",
+                     max_drift_px=MAX_DRIFT_PX)
 
     # Median + trimmed mean (disk-backed, no full-stack RAM alloc)
     median_frame = trimmed_frame = None
@@ -1590,7 +1699,8 @@ def analyze_gt_sequence(
             print(f"    {lab:<{width}s} {hp:.6f}   {base / hp:5.2f}x vs mean")
         print()
 
-    _write_run_info(seq_out, directory, fmt, n, n_stack, rev)
+    _write_run_info(seq_out, directory, fmt, n, n_stack, rev,
+                    n_dropped=stationarity.get('n_dropped', 0))
     print(f"\nDone. Outputs in {seq_out.resolve()}")
 
 
@@ -1598,7 +1708,7 @@ def analyze_gt_sequence(
 # CLI overrides + entry point                                                   #
 # --------------------------------------------------------------------------- #
 
-def _write_run_info(seq_out, directory, fmt, n, n_stack, rev):
+def _write_run_info(seq_out, directory, fmt, n, n_stack, rev, n_dropped=0):
     """
     Record what produced these outputs, next to the outputs themselves.
 
@@ -1619,6 +1729,7 @@ def _write_run_info(seq_out, directory, fmt, n, n_stack, rev):
             "sequence":  str(Path(directory).resolve()),
             "format":    fmt,
             "frames":    n,
+            "dropped_frames": n_dropped,   # excluded by MAX_DRIFT_PX, see gt_drift_*.png
             "stack":     n_stack,
         },
         "code": rev or {"note": "git unavailable — provenance not recorded"},

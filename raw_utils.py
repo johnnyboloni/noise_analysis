@@ -507,6 +507,52 @@ def encode_rgb(linear: np.ndarray, gain: float = 1.0,
     return np.clip(out, 0.0, 1.0) ** np.float32(1.0 / gamma)
 
 
+def temporal_std_map(paths, loader, workers: int = 1) -> np.ndarray:
+    """
+    Per-pixel temporal standard deviation across a sequence of frames, in raw
+    ADU. A single streaming pass (Welford's algorithm) -- the same computation
+    analyze_gt_sequence.py's _dark_master runs internally to set its sigma-clip
+    bounds, exposed here as a first-class result instead of an intermediate
+    that gets discarded after use.
+
+    This answers a different question than a mean-based defect map does. A
+    mean (a master dark, or the light average) can only ever reveal a pixel
+    with an anomalous LEVEL. It says nothing about a pixel with an anomalous
+    NOISE -- and level and noise are genuinely different failure modes: a
+    pixel can average out to a perfectly normal dark level while still
+    carrying excess temporal variance on every individual exposure, from
+    mechanisms a mean-based detector cannot see by construction, e.g. dark
+    shot noise scaling with an elevated (but not necessarily anomalous) dark
+    current, or random telegraph signal (RTS) -- a documented CMOS-specific
+    noise source, more prominent at high analog gain [Chao et al.,
+    "Statistical Analysis of the Random Telegraph Noise in a 1.1 um Pixel,
+    8.3 MP CMOS Image Sensor Using On-Chip Time Constant Extraction Method",
+    Sensors 17(12):2704, 2017, DOI: 10.3390/s17122704].
+
+    The result is in the same units (ADU) as a mean dark frame, so it can be
+    fed directly into the same generic per-pixel-map tools built for the
+    level-based case (_report_dark_uniformity, _defect_map,
+    _defect_sigma_scan in analyze_gt_sequence.py all operate on whatever
+    per-pixel map they're given, not specifically a mean) -- flagging
+    "anomalously noisy" pixels this way is the same MAD-thresholded local
+    comparison already used to flag "anomalously bright" ones, just applied to
+    a different per-pixel quantity.
+    """
+    n = len(paths)
+    mean = M2 = None
+    for i, (_p, frame) in enumerate(progress(
+            prefetch(paths, loader, workers), desc="  temporal std", total=n)):
+        x = frame.astype(np.float64)
+        if mean is None:
+            mean, M2 = x.copy(), np.zeros_like(x)
+        else:
+            d = x - mean
+            mean += d / (i + 1)
+            M2 += d * (x - mean)
+    print()
+    return np.sqrt(M2 / max(n - 1, 1)).astype(np.float32)
+
+
 def uniform_gain(frames, headroom: float = 1.0, percentile: float = 99.99) -> float:
     """
     The gain that puts the `percentile`-th brightest value across `frames`

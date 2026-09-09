@@ -922,12 +922,13 @@ def _interpolate_defects(frame, pattern, mask):
     return np.where(mask, med, frame).astype(np.float32)
 
 
-def _plot_defect_map(mask, n_hot, n_cold, out):
+def _plot_defect_map(mask, n_hot, n_cold, out, source="master dark",
+                     labels=("hot", "cold")):
     fig, ax = plt.subplots(figsize=(9, 6))
     ax.imshow(mask, cmap="gray", interpolation="nearest")
     frac = mask.mean() * 100
-    ax.set_title(f"Defect map from master dark — {n_hot} hot, {n_cold} cold "
-                 f"({frac:.4f}% of pixels)", fontsize=11)
+    ax.set_title(f"Defect map from {source} — {n_hot} {labels[0]}, "
+                 f"{n_cold} {labels[1]} ({frac:.4f}% of pixels)", fontsize=11)
     ax.axis("off")
     fig.tight_layout()
     fig.savefig(out, dpi=150, bbox_inches="tight")

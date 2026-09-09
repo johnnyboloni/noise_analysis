@@ -21,26 +21,44 @@ and subtracted separately instead [1][2].
 
 This script answers that on its own, streaming the light sequence exactly
 once: at each log-spaced checkpoint it computes the running mean's high-pass
-residual both with and without the master dark subtracted, alongside the
-usual split-half curve.
+residual with no correction, with the master dark subtracted, and (if
+HOT_PIXEL_SIGMA is set) with hot pixels also interpolated afterward -- the
+same two-part correction the main pipeline applies, subtraction then
+interpolation, tested together rather than assumed to both be pulling their
+weight.
+
+That third curve matters because subtraction and interpolation fix different
+things. Subtraction removes the bulk, smooth part of DSNU; a genuine hot
+pixel -- anomalous relative to its own local neighbourhood, not merely
+offset from it -- is not a pattern subtraction can cleanly remove, and needs
+individual detection and reconstruction instead. If dark-subtracted high-pass
+plateaus well above split-half but adding interpolation closes most of that
+gap, the remaining floor was hot pixels, not smooth DSNU; if interpolation
+barely moves it, something subtraction and interpolation both cannot reach
+is responsible instead -- most likely a capture-condition mismatch between
+the dark and light sequences (Section 5.3.2's second, non-reducible residual
+source), or a defect population too dense or too heavy-tailed for the current
+HOT_PIXEL_SIGMA to isolate cleanly.
 
 One shortcut worth knowing, because it halves the work here: split-half
-is mathematically UNCHANGED by dark subtraction. It is a difference of two
-independent sub-averages, (even - odd); the fixed dark-current pattern is
-common to both and subtracting a constant from both sides of a difference
-cancels out of it exactly. So there is only one temporal curve to compute --
-subtraction can only ever move the high-pass curve, never the split-half one
--- which is itself worth confirming against the plot this script produces.
+is mathematically UNCHANGED by dark subtraction (and by interpolation, for
+the same reason). It is a difference of two independent sub-averages,
+(even - odd); anything common to both -- the fixed dark-current pattern, or a
+per-pixel correction applied identically to both halves -- cancels out of the
+difference exactly. So there is only one temporal curve to compute regardless
+of how many correction curves are added -- which is itself worth confirming
+against the plot this script produces.
 
 Edit the CONFIG block below, then run:
     python check_dark_subtraction_convergence.py
 
 Output (saved to OUTPUT_DIR/<sequence_name>/):
-  - dark_subtraction_convergence.png : split-half, high-pass (no dark
-    subtraction), and high-pass (dark-subtracted) plotted together against
-    frames averaged, log-log, with a 1/sqrt(N) reference. Where the
-    dark-subtracted high-pass curve pulls away from the uncorrected one and
-    tracks split-half further out is the point subtraction earned its keep.
+  - dark_subtraction_convergence.png : split-half, and high-pass with no
+    correction / dark-subtracted / dark-subtracted + interpolated (the last
+    only if HOT_PIXEL_SIGMA is set), plotted together against frames
+    averaged, log-log, with a 1/sqrt(N) reference. Where each correction
+    curve pulls away from the ones before it and tracks split-half further
+    out is the point that correction earned its keep.
   - the same data printed as a table.
 
 [1] J. R. Janesick, "Photon Transfer: DN -> lambda", SPIE Press Monograph
@@ -84,6 +102,10 @@ N_CHECKPOINTS    = 8      # log-spaced checkpoints -- more than the main
                           # demosaic, no defect map, no DNG/PNG writes)
 DARK_MAX_FRAMES  = None   # cap the darks used to build the master, None = all
 DARK_SIGMA_CLIP  = 4.0    # see analyze_gt_sequence.py's DARK_SIGMA_CLIP comment
+HOT_PIXEL_SIGMA  = 5.0    # see analyze_gt_sequence.py's HOT_PIXEL_SIGMA comment
+                          # -- 0 or None skips the third (interpolated) curve
+DEFECT_METHOD    = "local"  # see analyze_gt_sequence.py's DEFECT_METHOD comment
+DEFECT_FILL      = "median" # see analyze_gt_sequence.py's DEFECT_FILL comment
 LOAD_WORKERS     = 4      # threads used to decode frames ahead of the pass
 
 
@@ -145,7 +167,7 @@ def _apply_cli_overrides() -> None:
             g[key] = new_val
 
 
-def _plot_convergence(rows, out):
+def _plot_convergence(rows, out, has_interp):
     ns   = np.array([r['n'] for r in rows], dtype=float)
     temp = np.array([r['temporal'] for r in rows], dtype=float)
     hp_u = np.array([r['highpass_uncorrected'] for r in rows], dtype=float)
@@ -155,11 +177,15 @@ def _plot_convergence(rows, out):
     ok = np.isfinite(temp)
     if ok.any():
         ax.loglog(ns[ok], temp[ok], "o-", color="steelblue", linewidth=1.8,
-                  label="split-half (temporal only -- unaffected by dark subtraction)")
+                  label="split-half (temporal only -- unaffected by dark correction)")
     ax.loglog(ns, hp_u, "s-", color="darkorange", linewidth=1.8,
-              label="high-pass, no dark subtraction")
+              label="high-pass, no correction")
     ax.loglog(ns, hp_c, "^-", color="seagreen", linewidth=1.8,
               label="high-pass, dark-subtracted")
+    if has_interp:
+        hp_i = np.array([r['highpass_corrected_interp'] for r in rows], dtype=float)
+        ax.loglog(ns, hp_i, "d-", color="crimson", linewidth=1.8,
+                  label="high-pass, dark-subtracted + hot pixels interpolated")
     if ok.any() and temp[ok][0] > 0:
         ref_n = ns[ok]
         ax.loglog(ref_n, temp[ok][0] * np.sqrt(ns[ok][0]) / np.sqrt(ref_n),
@@ -197,6 +223,25 @@ def main():
     print(f"  Master dark ADU: mean={dark_adu.mean():.2f}  min={dark_adu.min():.2f}  "
           f"max={dark_adu.max():.2f}  (from {d_stack} frames)")
 
+    # Defect mask, built once from the master dark -- same detection the main
+    # pipeline uses, so the third curve below tests the SAME two-part
+    # correction (subtract, then interpolate) rather than a different one.
+    mask = None
+    if HOT_PIXEL_SIGMA:
+        resid = gt_seq._dark_master_residual(d_paths, d_stack, d_loader, black, white)
+        if resid is not None:
+            resid_adu = resid * float(white - black[0])
+            mask, n_hot, n_cold = gt_seq._defect_map(dark_adu, pattern, resid_adu,
+                                                     HOT_PIXEL_SIGMA, method=DEFECT_METHOD)
+            print(f"  Defect map ({DEFECT_METHOD}, >{HOT_PIXEL_SIGMA}σ): "
+                  f"{n_hot} hot, {n_cold} cold, {mask.mean()*100:.4f}% of pixels")
+        else:
+            print("  Need at least 2 dark frames for defect detection -- skipping "
+                  "the interpolated curve.")
+    gt_seq.DEFECT_FILL = DEFECT_FILL   # _interpolate_defects reads this as a
+                                       # bare global on ITS module, not this
+                                       # script's -- see check_dark_frames.py
+
     ckpt_ns = sorted(set(np.geomspace(1, n, min(N_CHECKPOINTS, n)).astype(int).tolist()) | {n})
     checkpoints = set(ckpt_ns)
     print(f"\nStreaming mean ({n} frames), checkpoints at N={ckpt_ns} …")
@@ -227,6 +272,11 @@ def main():
         corrected = gt_seq._dark_correct(raw_mean_adu, dark_adu, pattern, black, white)
         hp_corrected = highpass_std(corrected, pattern)
 
+        hp_corrected_interp = None
+        if mask is not None:
+            corrected_interp = gt_seq._interpolate_defects(corrected, pattern, mask)
+            hp_corrected_interp = highpass_std(corrected_interp, pattern)
+
         if n_o > 0:
             half_diff = ((acc_e / n_e) - (acc_o / n_o)).astype(np.float32)
             half_diff /= float(white - black[0])
@@ -234,24 +284,35 @@ def main():
         else:
             temporal = float('nan')   # N=1: no second half to compare
 
-        rows.append({'n': n_used, 'temporal': temporal,
-                     'highpass_uncorrected': hp_uncorrected,
-                     'highpass_corrected': hp_corrected})
+        row = {'n': n_used, 'temporal': temporal,
+              'highpass_uncorrected': hp_uncorrected,
+              'highpass_corrected': hp_corrected}
+        if hp_corrected_interp is not None:
+            row['highpass_corrected_interp'] = hp_corrected_interp
+        rows.append(row)
     print()
 
+    has_interp = mask is not None
     width = 6
-    print(f"{'N':>{width}} {'temporal':>12} {'highpass (raw)':>16} "
-          f"{'highpass (dark-sub)':>20} {'ratio':>8}")
-    print("-" * 68)
+    header = f"{'N':>{width}} {'temporal':>12} {'highpass (raw)':>16} {'highpass (dark-sub)':>20}"
+    if has_interp:
+        header += f" {'+interpolated':>16}"
+    header += f" {'ratio':>8}"
+    print(header)
+    print("-" * len(header))
     for r in rows:
         ratio = r['highpass_corrected'] / r['highpass_uncorrected'] if r['highpass_uncorrected'] else float('nan')
         t = f"{r['temporal']:.6f}" if np.isfinite(r['temporal']) else "--"
-        print(f"{r['n']:>{width}} {t:>12} {r['highpass_uncorrected']:>16.6f} "
-              f"{r['highpass_corrected']:>20.6f} {ratio:>8.3f}")
+        line = (f"{r['n']:>{width}} {t:>12} {r['highpass_uncorrected']:>16.6f} "
+               f"{r['highpass_corrected']:>20.6f}")
+        if has_interp:
+            line += f" {r['highpass_corrected_interp']:>16.6f}"
+        line += f" {ratio:>8.3f}"
+        print(line)
 
     out_dir = Path(OUTPUT_DIR) / Path(SEQUENCE_DIR).name
     out_dir.mkdir(parents=True, exist_ok=True)
-    _plot_convergence(rows, out_dir / "dark_subtraction_convergence.png")
+    _plot_convergence(rows, out_dir / "dark_subtraction_convergence.png", has_interp)
 
     print(f"\nTotal time: {format_duration(time.monotonic() - t0)}")
     print(f"Outputs in {out_dir.resolve()}")

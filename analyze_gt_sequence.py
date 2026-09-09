@@ -11,7 +11,8 @@ Outputs (saved to OUTPUT_DIR/<sequence_name><RUN_SUFFIX>/):
                              directory that cannot be traced back to a code
                              state and a set of settings is guesswork later.
   - comparison/            : every GT candidate -- mean, defect-repaired,
-                             dark-subtracted, the gain=1 still, and (with
+                             dark-subtracted (both alone and with defects also
+                             interpolated), the gain=1 still, and (with
                              ROBUST_AGGREGATORS) median and trimmed mean --
                              each written full-resolution as .npy and .dng (to
                              feed onward) plus three PNGs to look at: _nogain
@@ -1627,7 +1628,8 @@ def analyze_gt_sequence(
     # ---------------------------------------------------------------- #
     # Dark subtraction                                                   #
     # ---------------------------------------------------------------- #
-    dark_corrected = None
+    dark_corrected = None        # dark-subtracted only, never reassigned below
+    dark_corrected_fixed = None  # dark-subtracted + defects interpolated, if any
     mean_defect_fixed = None
     if DARK_DIR:
         print(f"\n  Dark frames: {DARK_DIR}")
@@ -1719,8 +1721,8 @@ def analyze_gt_sequence(
                       f"mean+defectfix={highpass_std(mean_fixed, pattern):.6f}")
                 print(f"                  darksub={hp_after:.6f}  "
                       f"darksub+defectfix={highpass_std(dark_fixed, pattern):.6f}")
-                mean_defect_fixed = mean_fixed
-                dark_corrected    = dark_fixed
+                mean_defect_fixed    = mean_fixed
+                dark_corrected_fixed = dark_fixed
 
     # ---------------------------------------------------------------- #
     # Comparison of GT candidates                                        #
@@ -1739,11 +1741,11 @@ def analyze_gt_sequence(
         cands.append((mean_defect_fixed,
                       f"Mean + defects interpolated  (N={n})", "mean_defectfix"))
     if dark_corrected is not None:
-        label = "Mean − dark" + (" + defects interpolated"
-                                 if mean_defect_fixed is not None else "")
-        slug  = "mean_darksub" + ("_defectfix"
-                                  if mean_defect_fixed is not None else "")
-        cands.append((dark_corrected, f"{label}  (N={n})", slug))
+        cands.append((dark_corrected, f"Mean − dark  (N={n})", "mean_darksub"))
+    if dark_corrected_fixed is not None:
+        cands.append((dark_corrected_fixed,
+                      f"Mean − dark + defects interpolated  (N={n})",
+                      "mean_darksub_defectfix"))
     if STILLS_DIR:
         print(f"\n  Stills: {STILLS_DIR}")
         still, n_still, scale = _stills_reference(

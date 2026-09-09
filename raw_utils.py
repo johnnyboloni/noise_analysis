@@ -627,6 +627,38 @@ def drift_report(shifts: np.ndarray) -> dict:
     return {"spread_px": spread, "total_px": total, "excursion_px": peak}
 
 
+def highpass_residual(frame: np.ndarray, pattern: np.ndarray, ksize: int = 5) -> np.ndarray:
+    """
+    The high-pass residual itself (frame minus a local box mean), per Bayer
+    sub-plane, reassembled to full-frame shape -- e.g. to crop and plot
+    directly as a picture of pixel-to-pixel noise, with real scene content
+    subtracted away. See highpass_std, which reduces this to one scalar; kept
+    as a separate function (rather than refactoring highpass_std to call this)
+    so nothing already relying on highpass_std's exact numbers -- the floor
+    model, defect thresholds, the printed noise tables -- is at any risk from
+    a change made only to support a new plot.
+
+    Unlike highpass_std, edge pixels (where the box mean isn't defined) are
+    left at zero residual rather than excluded, since a plotted crop needs a
+    value at every pixel; this does not affect highpass_std itself.
+    """
+    resid = np.zeros_like(frame, dtype=np.float32)
+    for r in range(2):
+        for c in range(2):
+            plane = np.ascontiguousarray(frame[r::2, c::2], dtype=np.float32)
+            if _HAS_CV2:
+                smooth = cv2.blur(plane, (ksize, ksize))
+                resid[r::2, c::2] = plane - smooth
+            else:
+                from numpy.lib.stride_tricks import sliding_window_view
+                pad = ksize // 2
+                smooth = sliding_window_view(plane, (ksize, ksize)).mean(axis=(-1, -2))
+                sub = resid[r::2, c::2]
+                sub[pad:-pad, pad:-pad] = plane[pad:-pad, pad:-pad] - smooth
+                resid[r::2, c::2] = sub
+    return resid
+
+
 def highpass_std(frame: np.ndarray, pattern: np.ndarray, ksize: int = 5) -> float:
     """
     Std of the high-pass residual (frame minus a local box mean), averaged over

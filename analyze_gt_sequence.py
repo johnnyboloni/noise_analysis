@@ -32,11 +32,18 @@ Outputs (saved to OUTPUT_DIR/<sequence_name><RUN_SUFFIX>/):
                              frames) alongside the high-pass residual, against
                              a 1/sqrt(N) reference. Where the two diverge the
                              frame is fixed-pattern-noise limited.
-  - gt_running_mean_comparison_*, gt_halfdiff_comparison_*
+  - gt_running_mean_comparison_*, gt_halfdiff_comparison_*,
+    gt_highpass_comparison_*
                            : a 100%-zoom crop of the running mean at each
-                             checkpoint, and the split-half difference at each
+                             checkpoint; the split-half difference at each
                              checkpoint (temporal noise alone -- scene and FPN
-                             cancel in the subtraction)
+                             cancel in the subtraction, so this keeps shrinking
+                             with N); and the running mean's own high-pass
+                             residual at each checkpoint (temporal noise AND
+                             FPN together -- shrinks only until temporal noise
+                             stops dominating, then visibly flattens, the same
+                             floor gt_checkpoint_noise.png's two curves diverge
+                             at, made visible panel to panel)
   - gt_dark_uniformity_*.png : whether the master dark is spatially flat --
                              full resolution, block-averaged, and row/column
                              median profiles, per-channel offset removed. The
@@ -104,7 +111,7 @@ from raw_utils import (
     load_raw, load_raw_gn3,
     calibrate_frame, demosaic_linear, encode_rgb, uniform_gain, save_rgb_png,
     bayer_subplane_crop, phase_shift, drift_report,
-    highpass_std, bayer_plane_median3, directional_fill_bayer,
+    highpass_std, highpass_residual, bayer_plane_median3, directional_fill_bayer,
     progress, prefetch, format_duration,
     uncalibrate_frame, save_dng, get_dng_color_matrix, git_revision,
     read_dng_color_tags,
@@ -1042,6 +1049,46 @@ def _plot_halfdiff_crops(crops, out, crop_size, vmax):
     print(f"Saved {out}")
 
 
+def _plot_highpass_crops(crops, out, crop_size, vmax):
+    """
+    High-pass residual at each checkpoint: temporal noise AND fixed-pattern
+    noise together, unlike _plot_halfdiff_crops which cancels FPN out.
+
+    This is the direct visual counterpart of gt_checkpoint_noise.png's two
+    curves: the split-half crops (halfdiff) keep shrinking with N, all the way
+    down; these crops shrink only as long as temporal noise still dominates,
+    then visibly stop changing once fixed-pattern noise is what's left -- the
+    same floor the split-half-vs-highpass divergence identifies numerically,
+    made visible panel to panel.
+
+    All panels share one colour scale, fixed from the first (noisiest)
+    checkpoint, for the same reason as _plot_halfdiff_crops: per-panel
+    autoscaling would hide exactly the shrinkage (or lack of it) this exists
+    to show.
+    """
+    n_panels = len(crops)
+    fig, axes = plt.subplots(1, n_panels, figsize=(4.2 * n_panels, 5.0))
+    if n_panels == 1:
+        axes = [axes]
+    im = None
+    for ax, (idx, crop, sd) in zip(axes, crops):
+        im = ax.imshow(crop, cmap="RdBu_r", vmin=-vmax, vmax=vmax,
+                       interpolation="nearest")
+        ax.set_title(f"N = {idx}\nstd = {sd:.6f}", fontsize=11)
+        ax.axis("off")
+    if im is not None:
+        fig.colorbar(im, ax=axes, fraction=0.02, pad=0.02,
+                     label="high-pass residual [calibrated]")
+    fig.suptitle(
+        f"Temporal noise + FPN — high-pass residual, {crop_size}×{crop_size} "
+        f"centre crop, shared colour scale (does not cancel FPN, unlike "
+        f"split-half)",
+        fontsize=12, y=1.02)
+    fig.savefig(out, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved {out}")
+
+
 def _stills_reference(directory, shape, match_to=None):
     """
     Reference frame from the gain=1 stills, calibrated with the stills' OWN
@@ -1436,8 +1483,9 @@ def analyze_gt_sequence(
     # spacing would put every panel in the flat tail and show no visible change.
     ckpt_ns = sorted(set(np.geomspace(1, n, min(N_CHECKPOINTS, n))
                          .astype(int).tolist()) | {n})
-    ckpt_crops, half_crops = [], []
+    ckpt_crops, half_crops, hp_crops = [], [], []
     half_vmax = []            # one-element cell: shared scale, set on first diff
+    hp_vmax   = []            # same, for the high-pass crops
 
     def _crop_centre(a, size):
         cy, cx = a.shape[0] // 2, a.shape[1] // 2
@@ -1457,6 +1505,21 @@ def analyze_gt_sequence(
         # panels being comparable, which is the entire point of the figure.
         lin = demosaic_linear(running, pattern, wb, ccm)
         ckpt_crops.append((idx, _crop_centre(lin, CHECKPOINT_CROP)))
+
+        # High-pass residual of the running mean itself: temporal noise AND
+        # FPN together, computed on the full frame (never a crop alone -- the
+        # box filter needs real neighbours at the crop border) then cropped
+        # for display, same reasoning as the running-mean crop above.
+        hp = highpass_residual(running, pattern)
+        if not hp_vmax:
+            hp_vmax.append(max(float(np.percentile(np.abs(hp), 99.5)), 1e-9))
+        # highpass_std(running, ...), not hp.std(): the label should match the
+        # exact number gt_checkpoint_noise.png plots and _print_checkpoint_table
+        # prints (per-sub-plane std, averaged over the four), not a single std
+        # over the reassembled residual, which is a slightly different quantity.
+        hp_crops.append((idx, _crop_centre(hp, CHECKPOINT_CROP),
+                         highpass_std(running, pattern)))
+
         if half_diff is None:
             return
         # Fix the display scale from the first (noisiest) checkpoint and keep
@@ -1480,6 +1543,10 @@ def analyze_gt_sequence(
         _plot_halfdiff_crops(half_crops,
                              seq_out / f"gt_halfdiff_comparison_N{n}.png",
                              CHECKPOINT_CROP, half_vmax[0])
+    if hp_crops:
+        _plot_highpass_crops(hp_crops,
+                             seq_out / f"gt_highpass_comparison_N{n}.png",
+                             CHECKPOINT_CROP, hp_vmax[0])
     _print_checkpoint_table(ckpt_metrics)
     _plot_checkpoint_noise(ckpt_metrics,
                            seq_out / f"gt_checkpoint_noise_N{n}.png")

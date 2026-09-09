@@ -11,6 +11,14 @@ dark-subtracts once, at the very end, using the finished average, so there is
 no existing way to see whether subtraction actually raises the point where the
 curves diverge without rerunning the whole pipeline.
 
+The floor itself, in a dark frame, is DSNU (Dark Signal Non-Uniformity): each
+pixel's dark-current generation rate varies slightly due to manufacturing
+variation, and that variation is a fixed, pixel-specific pattern rather than
+random from frame to frame -- it is imprinted identically on every exposure
+taken under matching conditions (exposure time, gain, temperature), which is
+exactly why it survives averaging the light sequence and has to be measured
+and subtracted separately instead [1][2].
+
 This script answers that on its own, streaming the light sequence exactly
 once: at each log-spaced checkpoint it computes the running mean's high-pass
 residual both with and without the master dark subtracted, alongside the
@@ -34,6 +42,12 @@ Output (saved to OUTPUT_DIR/<sequence_name>/):
     dark-subtracted high-pass curve pulls away from the uncorrected one and
     tracks split-half further out is the point subtraction earned its keep.
   - the same data printed as a table.
+
+[1] J. R. Janesick, "Photon Transfer: DN -> lambda", SPIE Press Monograph
+    PM170, 2007. DOI: 10.1117/3.725073.
+[2] EMVA Standard 1288 -- "Standard for Characterization of Image Sensors and
+    Cameras", European Machine Vision Association, Release 3.1.
+    https://www.emva.org/standards-technology/emva-1288/
 """
 
 import argparse

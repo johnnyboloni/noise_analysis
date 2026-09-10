@@ -29,6 +29,10 @@ Edit the CONFIG block below, then run:
     python check_noisy_pixels.py
 
 Output (saved to OUTPUT_DIR/<dark_dir_name>/):
+  - mean_histogram.png : histogram of the master dark's per-pixel mean values
+    (raw ADU) -- the level distribution the noise-based map is checked
+    against, so a genuinely bimodal/RTS-like level distribution is visible
+    directly rather than only inferred from the noise map.
   - noise_uniformity.png : is the sensor's TEMPORAL NOISE spatially uniform?
     Same four-panel report as analyze_gt_sequence.py's gt_dark_uniformity,
     applied to the std map instead of the mean -- full resolution,
@@ -51,6 +55,7 @@ from pathlib import Path
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 from raw_utils import (
     detect_format, find_dngs, find_raws,
@@ -76,6 +81,24 @@ NOISE_SIGMA     = 5.0    # noise-based threshold -- see analyze_gt_sequence.py's
                          # the std map. Tune with noise_sigma_scan.png.
 DEFECT_METHOD   = "local"   # see analyze_gt_sequence.py's DEFECT_METHOD comment
 LOAD_WORKERS    = 4
+
+
+def _plot_mean_histogram(dark_adu: np.ndarray, black: float, out: Path) -> None:
+    """Histogram of the master dark's per-pixel mean values (raw ADU)."""
+    vals = dark_adu.ravel()
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.hist(vals, bins=200, color="steelblue", log=True)
+    ax.axvline(black, color="crimson", linestyle="--", linewidth=1,
+               label=f"black level = {black:.1f}")
+    ax.axvline(vals.mean(), color="black", linestyle=":", linewidth=1,
+               label=f"mean = {vals.mean():.2f}")
+    ax.set_xlabel("Master dark value (raw ADU)")
+    ax.set_ylabel("Pixel count (log)")
+    ax.set_title("Histogram of mean frame values (master dark)")
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(out, dpi=150)
+    plt.close(fig)
 
 
 def _make_loader(directory: str):
@@ -154,6 +177,7 @@ def main():
     n_want = DARK_MAX_FRAMES or n
     print(f"\nSigma-clipped master dark (level) from {min(n_want, n)}/{n} frames …")
     dark_adu, d_stack = gt_seq._dark_master(paths, n_want, loader, DARK_SIGMA_CLIP)
+    _plot_mean_histogram(dark_adu, black[0], out_dir / "mean_histogram.png")
     resid = gt_seq._dark_master_residual(paths, d_stack, loader, black, white)
     level_mask = np.zeros(dark_adu.shape, dtype=bool)
     if resid is not None:

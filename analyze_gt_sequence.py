@@ -60,6 +60,14 @@ Outputs (saved to OUTPUT_DIR/<sequence_name><RUN_SUFFIX>/):
   - gt_defect_sigma_scan.png
                            : flagged fraction vs threshold, for choosing
                              HOT_PIXEL_SIGMA (only when DARK_DIR is set)
+  - gt_stuck_pixel_map.png/.npy : pixels whose TEMPORAL STD across the dark
+                             sequence is anomalously low relative to their
+                             same-colour neighbours (stuck/dead), via
+                             STUCK_PIXEL_SIGMA. A different test from
+                             gt_defect_map -- level vs noise -- so it catches
+                             pixels with a normal mean that never fluctuate,
+                             invisible to the level-based map (only when
+                             DARK_DIR is set)
   - gt_drift_*.png         : per-frame position over the run, the path it
                              traced, and the distribution of drift magnitudes,
                              from phase correlation on a Bayer sub-plane crop.
@@ -113,6 +121,7 @@ from raw_utils import (
     calibrate_frame, demosaic_linear, encode_rgb, uniform_gain, save_rgb_png,
     bayer_subplane_crop, phase_shift, drift_report,
     highpass_std, highpass_residual, bayer_plane_median3, directional_fill_bayer,
+    temporal_std_map,
     progress, prefetch, format_duration,
     uncalibrate_frame, save_dng, get_dng_color_matrix, git_revision,
     read_dng_color_tags,
@@ -124,7 +133,7 @@ from raw_utils import (
 # ============================================================
 SEQUENCE_DIR  = "/path/to/static/sequence"
 OUTPUT_DIR    = "output/gt_analysis"
-RUN_SUFFIX    = "_pctile_gain"   # appended to the per-sequence output dir, so
+RUN_SUFFIX    = "_stuck_pixel_fix"   # appended to the per-sequence output dir, so
                                    # runs sit side by side instead of
                                    # overwriting each other and the directory
                                    # name says what was being tested.
@@ -185,6 +194,20 @@ DARK_SIGMA_CLIP = 4.0   # reject dark samples beyond this many sigma from the
 HOT_PIXEL_SIGMA = 5.0   # flag master-dark pixels this many residual-sigma from
                         # their same-colour neighbours as defects, and repair
                         # them by interpolation. 0 or None = skip.
+STUCK_PIXEL_SIGMA = 5.0  # flag pixels whose TEMPORAL STD across the dark
+                        # sequence is this many robust-sigma BELOW their
+                        # same-colour neighbours, and repair by interpolation.
+                        # Not the same test as HOT_PIXEL_SIGMA: that one looks
+                        # at the master dark's LEVEL, this one at its per-pixel
+                        # NOISE, so it catches pixels that read a normal mean
+                        # but never fluctuate (stuck/dead) -- invisible to a
+                        # level-based threshold. Deliberately one-sided: the
+                        # opposite tail (anomalously HIGH temporal noise, e.g.
+                        # RTS) was tested (check_noisy_pixels.py) and found to
+                        # be a continuous population with no natural cutoff,
+                        # not a discrete defect -- thresholding it costs real
+                        # detail for no measured benefit, so only the stuck/low
+                        # side is corrected here. 0 or None = skip.
 DEFECT_METHOD   = "local"  # "local" (default) subtracts a same-colour local
                         # median before thresholding, so real sensor structure
                         # (gradients, banding, channel offsets) isn't mistaken
@@ -810,6 +833,43 @@ def _defect_map(dark_adu, pattern, resid_adu, n_sigma, method='local'):
             hot[r::2, c::2]  = v > med + n_sigma * sigma
             cold[r::2, c::2] = v < med - n_sigma * sigma
     return (hot | cold), int(hot.sum()), int(cold.sum())
+
+
+def _stuck_pixel_map(std_map, pattern, n_sigma, method='local'):
+    """
+    Locate stuck/dead pixels: temporal std anomalously LOW relative to their
+    same-colour neighbours -- not literally std == 0. A stuck pixel need not
+    be perfectly flat to be broken (a pinned ADC bit or a saturated node can
+    still show a sliver of coupling/quantization noise well below the
+    sensor's real read-noise floor), so a robust MAD-derived threshold on
+    std_map catches it, the same way _defect_map's cold side catches a level
+    that is merely far too low rather than exactly zero.
+
+    Only the cold (low) side is flagged -- the opposite tail (excess temporal
+    noise, e.g. RTS) was tested directly in check_noisy_pixels.py and found to
+    be a continuous population with no natural cutoff, not a discrete defect,
+    so it is deliberately not thresholded here. See STUCK_PIXEL_SIGMA's
+    comment.
+
+    Same local/global choice and MAD-derived robust threshold as _defect_map
+    -- see its docstring. Returns (mask, n_stuck).
+    """
+    if method == 'local':
+        dev = std_map - bayer_plane_median3(std_map, pattern)
+    elif method == 'global':
+        dev = std_map
+    else:
+        raise ValueError(f"unknown defect method {method!r}; expected 'local' or 'global'")
+    mask = np.zeros(std_map.shape, dtype=bool)
+    for r in range(2):
+        for c in range(2):
+            v     = dev[r::2, c::2]
+            med   = np.median(v)
+            sigma = 1.4826 * np.median(np.abs(v - med))
+            if sigma <= 0:
+                sigma = 1e-9
+            mask[r::2, c::2] = v < med - n_sigma * sigma
+    return mask, int(mask.sum())
 
 
 def _defect_sigma_scan(dark_adu, pattern, out, current_sigma, method='local'):
@@ -1672,6 +1732,8 @@ def analyze_gt_sequence(
                   "the plain mean, or capture more darks.")
 
         # Defect map: detected in the master dark, repaired in the light frame.
+        mask = np.zeros(dark_adu.shape, dtype=bool)
+        n_hot = n_cold = 0
         if HOT_PIXEL_SIGMA and resid is not None:
             resid_adu = resid * float(white - black[0])
             mask, n_hot, n_cold = _defect_map(dark_adu, pattern, resid_adu,
@@ -1700,29 +1762,52 @@ def analyze_gt_sequence(
                                  seq_out / "gt_defect_map.png")
                 np.save(seq_out / "gt_defect_map.npy", mask)
 
-                # Two repaired variants, so the dark subtraction can be judged
-                # separately from the defect repair rather than bundled with it.
-                #
-                # Repair happens AFTER the subtraction, never before. A defect's
-                # dark value is large; interpolating first and then subtracting
-                # it removes that large value from an already-repaired pixel and
-                # punches a hole. Measured on synthetic data: subtract-then-
-                # interpolate leaves 1.98 ADU of error at defects, the reverse
-                # order leaves 83.20.
-                #
-                # Repairing the averaged frame is also all that is needed --
-                # cubic fill is linear and the mask is static, so repairing
-                # every frame first gives a bit-identical result for N times
-                # the work (verified: max difference 2e-5, float noise).
-                mean_fixed = _interpolate_defects(full_mean, pattern, mask)
-                dark_fixed = _interpolate_defects(dark_corrected, pattern, mask)
+        # Stuck/dead pixels: flagged from the dark sequence's TEMPORAL STD
+        # rather than its level, so this runs independently of HOT_PIXEL_SIGMA
+        # -- a stuck pixel can have a perfectly ordinary mean. See
+        # STUCK_PIXEL_SIGMA's comment for why only the low-noise side is
+        # thresholded.
+        if STUCK_PIXEL_SIGMA:
+            print(f"\n  Temporal std map from "
+                  f"{min(n_dark_want, len(d_paths))}/{len(d_paths)} frames …")
+            std_map = temporal_std_map(d_paths[:n_dark_want], d_loader, LOAD_WORKERS)
+            stuck_mask, n_stuck = _stuck_pixel_map(
+                std_map, pattern, STUCK_PIXEL_SIGMA, method=DEFECT_METHOD)
+            print(f"  Stuck-pixel map ({DEFECT_METHOD}, temporal std >"
+                  f"{STUCK_PIXEL_SIGMA}σ below same-colour neighbours): "
+                  f"{n_stuck} pixels, {stuck_mask.mean() * 100:.4f}% of pixels")
+            if stuck_mask.any():
+                _plot_defect_map(stuck_mask, 0, n_stuck,
+                                 seq_out / "gt_stuck_pixel_map.png",
+                                 source="dark-sequence temporal std map",
+                                 labels=("(n/a)", "stuck"))
+                np.save(seq_out / "gt_stuck_pixel_map.npy", stuck_mask)
+            mask = mask | stuck_mask
 
-                print(f"  High-pass std   mean={hp_before:.6f}  "
-                      f"mean+defectfix={highpass_std(mean_fixed, pattern):.6f}")
-                print(f"                  darksub={hp_after:.6f}  "
-                      f"darksub+defectfix={highpass_std(dark_fixed, pattern):.6f}")
-                mean_defect_fixed    = mean_fixed
-                dark_corrected_fixed = dark_fixed
+        if mask.any():
+            # Two repaired variants, so the dark subtraction can be judged
+            # separately from the defect repair rather than bundled with it.
+            #
+            # Repair happens AFTER the subtraction, never before. A defect's
+            # dark value is large; interpolating first and then subtracting
+            # it removes that large value from an already-repaired pixel and
+            # punches a hole. Measured on synthetic data: subtract-then-
+            # interpolate leaves 1.98 ADU of error at defects, the reverse
+            # order leaves 83.20.
+            #
+            # Repairing the averaged frame is also all that is needed --
+            # cubic fill is linear and the mask is static, so repairing
+            # every frame first gives a bit-identical result for N times
+            # the work (verified: max difference 2e-5, float noise).
+            mean_fixed = _interpolate_defects(full_mean, pattern, mask)
+            dark_fixed = _interpolate_defects(dark_corrected, pattern, mask)
+
+            print(f"\n  High-pass std   mean={hp_before:.6f}  "
+                  f"mean+defectfix={highpass_std(mean_fixed, pattern):.6f}")
+            print(f"                  darksub={hp_after:.6f}  "
+                  f"darksub+defectfix={highpass_std(dark_fixed, pattern):.6f}")
+            mean_defect_fixed    = mean_fixed
+            dark_corrected_fixed = dark_fixed
 
     # ---------------------------------------------------------------- #
     # Comparison of GT candidates                                        #

@@ -29,6 +29,12 @@ Outputs (saved to OUTPUT_DIR/<sequence_name><RUN_SUFFIX>/):
                              Residual pixel noise is printed. This is the
                              only place frame data is written; there are no
                              duplicate copies at the top level.
+  - comparison/crops/      : the same three PNGs per candidate, cropped to a
+                             CROP_SIZE square at CROP_XY -- at the SAME gains
+                             as the full-frame versions (not re-gained from
+                             just the crop), so a 100%-zoom look at one region
+                             without opening the full-resolution files. None
+                             or CROP_SIZE = 0 skips this.
   - gt_checkpoint_noise.png: measured noise vs frames averaged -- split-half
                              temporal noise (unbiased; the two halves share no
                              frames) alongside the high-pass residual, against
@@ -315,6 +321,14 @@ GAIN_PERCENTILE = 99.99  # the display gain for _uniform/_max PNGs and the
                         # allow 1.60x (36% brighter), clipping only those same
                         # few pixels. Set to 100 for the old zero-clipping
                         # guarantee if that tradeoff is ever wrong here.
+CROP_XY   = (1500, 1800)  # (x, y) pixel coords of the top-left corner for
+                        # comparison/crops/ -- a 100%-crop region saved for
+                        # every candidate, at the SAME gains as the
+                        # full-frame PNGs (not re-gained from just the crop),
+                        # so a crop is literally a sub-region of its full
+                        # image, directly comparable crop to crop. None or
+                        # CROP_SIZE = 0 skips this.
+CROP_SIZE = 2000          # crop side length in pixels (square)
 SAVE_DNG        = True  # write a .dng next to every GT candidate PNG, in raw
                         # ADU with the black pedestal restored, so downstream
                         # tools read it exactly like an original capture
@@ -1743,6 +1757,15 @@ def analyze_gt_sequence(
     # AsShotNeutral is the camera-space value of a neutral patch, i.e. the
     # reciprocal of the white-balance gains that get applied to reach neutral.
     neutral = (1.0 / np.asarray(wb, dtype=float)) if wb is not None else None
+    crop_dir = None  # set below, inside the comparison block, if CROP_XY/CROP_SIZE
+
+    def _save_three_gains(lin_rgb, gain, own_gain, base):
+        save_rgb_png(encode_rgb(lin_rgb),
+                     base.with_name(base.name + "_nogain.png"))
+        save_rgb_png(encode_rgb(lin_rgb, gain=gain),
+                     base.with_name(base.name + "_uniform.png"))
+        save_rgb_png(encode_rgb(lin_rgb, gain=own_gain),
+                     base.with_name(base.name + "_max.png"))
 
     def save_candidate(frame, lin_rgb, gain, base):
         # Three PNGs per candidate, all gamma-encoded, none auto-brightened:
@@ -1766,12 +1789,11 @@ def analyze_gt_sequence(
         #               scene is genuinely dimmer. Use _uniform to compare
         #               candidates, _max to look at just one on its own.
         own_gain = uniform_gain([lin_rgb], percentile=GAIN_PERCENTILE)
-        save_rgb_png(encode_rgb(lin_rgb),
-                     base.with_name(base.name + "_nogain.png"))
-        save_rgb_png(encode_rgb(lin_rgb, gain=gain),
-                     base.with_name(base.name + "_uniform.png"))
-        save_rgb_png(encode_rgb(lin_rgb, gain=own_gain),
-                     base.with_name(base.name + "_max.png"))
+        _save_three_gains(lin_rgb, gain, own_gain, base)
+        if crop_dir is not None:
+            cx, cy = CROP_XY
+            crop = lin_rgb[cy:cy + CROP_SIZE, cx:cx + CROP_SIZE]
+            _save_three_gains(crop, gain, own_gain, crop_dir / base.name)
         if SAVE_NPY:
             np.save(base.with_suffix('.npy'), frame.astype(np.float32))
             print(f"Saved {base.with_suffix('.npy')}")
@@ -1948,6 +1970,9 @@ def analyze_gt_sequence(
     if len(cands) > 1:
         cmp_dir = seq_out / "comparison"
         cmp_dir.mkdir(parents=True, exist_ok=True)
+        if CROP_XY and CROP_SIZE:
+            crop_dir = cmp_dir / "crops"
+            crop_dir.mkdir(parents=True, exist_ok=True)
         print(f"\n  Comparing {len(cands)} GT candidates …")
 
         frames = [c[0] for c in cands]

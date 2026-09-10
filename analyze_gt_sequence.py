@@ -12,8 +12,9 @@ Outputs (saved to OUTPUT_DIR/<sequence_name><RUN_SUFFIX>/):
                              state and a set of settings is guesswork later.
   - comparison/            : every GT candidate -- mean, defect-repaired,
                              dark-subtracted (both alone and with defects also
-                             interpolated), the gain=1 still, and (with
-                             ROBUST_AGGREGATORS) median and trimmed mean --
+                             interpolated), the gain=1 still, (with
+                             ROBUST_AGGREGATORS) median and trimmed mean, and
+                             (with SIGMA_CLIP_MEAN) a sigma-clipped mean --
                              each written full-resolution as .npy and .dng (to
                              feed onward) plus three PNGs to look at: _nogain
                              (gain 1.0, the scene as calibrated), _uniform (one
@@ -180,6 +181,19 @@ ROBUST_AGGREGATORS = False  # also produce a median and a trimmed mean, as extra
                       # compare them fairly, raise MAX_STACK to N first.
 MAX_STACK     = 60    # max frames loaded into RAM for median / trimmed-mean
 TRIM_FRAC     = 0.05  # total fraction trimmed (symmetric: TRIM_FRAC/2 from each tail)
+
+SIGMA_CLIP_MEAN = None  # also produce a per-pixel sigma-clipped mean, as an
+                      # extra GT candidate alongside the plain mean -- reuses
+                      # the same two-pass clip already used to build the
+                      # master dark, applied here to the light sequence.
+                      # Value is the sigma threshold (e.g. 4.0); 0 or None =
+                      # skip. Off by default: it costs two extra full passes
+                      # over the sequence. Unlike ROBUST_AGGREGATORS' median
+                      # and trimmed mean, this is streaming and needs no
+                      # full-stack RAM/disk, so it runs on all N frames rather
+                      # than being capped at MAX_STACK -- directly comparable
+                      # to the plain mean at the same N, with no built-in
+                      # noise penalty from a smaller sample.
 
 N_CHECKPOINTS   = 5     # running-mean snapshots taken while streaming (log-spaced in N)
 CHECKPOINT_CROP = 400   # centre-crop size (px) for the 100%-zoom checkpoint comparison
@@ -1705,6 +1719,14 @@ def analyze_gt_sequence(
             paths, n_stack, pattern, black, white, loader, TRIM_FRAC, tmp_path,
         )
 
+    # Sigma-clipped mean (streaming, all N frames -- reuses the same two-pass
+    # clip the master dark is built with, see SIGMA_CLIP_MEAN's comment).
+    sigma_clip_frame = None
+    if SIGMA_CLIP_MEAN:
+        print(f"  Sigma-clipped mean (±{SIGMA_CLIP_MEAN}σ, {n} frames) …")
+        sc_adu, sc_n = _dark_master(paths, n, loader, SIGMA_CLIP_MEAN)
+        sigma_clip_frame = calibrate_frame(sc_adu, pattern, black, white)
+
     # Full-resolution saves: an RGB PNG to look at, and a DNG to feed onward.
     # The DNG carries the sequence's own black/white levels and camera profile,
     # so a GT frame drops into the same tooling as an original capture.
@@ -1900,6 +1922,10 @@ def analyze_gt_sequence(
     if median_frame is not None:
         cands += [(median_frame,  f"Median  (N={n_stack})",       "median"),
                   (trimmed_frame, f"Trimmed mean  (N={n_stack})", "trimmed_mean")]
+    if sigma_clip_frame is not None:
+        cands.append((sigma_clip_frame,
+                      f"Sigma-clipped mean, ±{SIGMA_CLIP_MEAN}σ  (N={n})",
+                      "sigma_clip_mean"))
     if mean_defect_fixed is not None:
         cands.append((mean_defect_fixed,
                       f"Mean + defects interpolated  (N={n})", "mean_defectfix"))

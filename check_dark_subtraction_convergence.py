@@ -58,7 +58,12 @@ Output (saved to OUTPUT_DIR/<sequence_name>/):
     only if HOT_PIXEL_SIGMA is set), plotted together against frames
     averaged, log-log, with a 1/sqrt(N) reference. Where each correction
     curve pulls away from the ones before it and tracks split-half further
-    out is the point that correction earned its keep.
+    out is the point that correction earned its keep. Also draws the master
+    dark's own high-pass std as a horizontal reference line: a scene-free
+    measurement of FPN alone, since a dark frame has no scene content to
+    confound it. A light-sequence curve plateauing AT that line is FPN;
+    plateauing ABOVE it means something else -- most plausibly real scene
+    texture surviving the same 5x5 filter -- is contributing too.
   - the same data printed as a table.
 
 [1] J. R. Janesick, "Photon Transfer: DN -> lambda", SPIE Press Monograph
@@ -167,7 +172,7 @@ def _apply_cli_overrides() -> None:
             g[key] = new_val
 
 
-def _plot_convergence(rows, out, has_interp):
+def _plot_convergence(rows, out, has_interp, master_hp=None):
     ns   = np.array([r['n'] for r in rows], dtype=float)
     temp = np.array([r['temporal'] for r in rows], dtype=float)
     hp_u = np.array([r['highpass_uncorrected'] for r in rows], dtype=float)
@@ -190,6 +195,14 @@ def _plot_convergence(rows, out, has_interp):
         ref_n = ns[ok]
         ax.loglog(ref_n, temp[ok][0] * np.sqrt(ns[ok][0]) / np.sqrt(ref_n),
                   "--", color="gray", linewidth=1.3, label=r"ideal $\propto 1/\sqrt{N}$")
+    if master_hp is not None:
+        # The master dark has no scene at all -- its own high-pass std is a
+        # scene-free measurement of FPN alone. If a light-sequence curve's
+        # plateau lands near this line, that plateau is FPN; if it plateaus
+        # well above it, something other than FPN (e.g. real scene texture
+        # surviving the same 5x5 filter) is contributing too.
+        ax.axhline(master_hp, color="purple", linewidth=1.3, linestyle=":",
+                  label=f"master dark's own high-pass std (scene-free FPN): {master_hp:.6f}")
     ax.set_xlabel("frames averaged (N)")
     ax.set_ylabel("noise (calibrated units)")
     ax.set_title("Does dark subtraction move where high-pass diverges from split-half?")
@@ -222,6 +235,13 @@ def main():
     dark_adu, d_stack = gt_seq._dark_master(d_paths, n_dark_want, d_loader, DARK_SIGMA_CLIP)
     print(f"  Master dark ADU: mean={dark_adu.mean():.2f}  min={dark_adu.min():.2f}  "
           f"max={dark_adu.max():.2f}  (from {d_stack} frames)")
+
+    # Scene-free reference: the master dark has no scene at all, so its own
+    # high-pass std isolates FPN with no possible contribution from real
+    # scene texture surviving the same 5x5 filter -- unlike the light
+    # sequence's high-pass curves, which cannot tell the two apart.
+    master_hp = highpass_std(dark_adu.astype(np.float32) / float(white - black[0]), pattern)
+    print(f"  Master dark's own high-pass std (scene-free FPN estimate): {master_hp:.6f}")
 
     # Defect mask, built once from the master dark -- same detection the main
     # pipeline uses, so the third curve below tests the SAME two-part
@@ -312,7 +332,8 @@ def main():
 
     out_dir = Path(OUTPUT_DIR) / Path(SEQUENCE_DIR).name
     out_dir.mkdir(parents=True, exist_ok=True)
-    _plot_convergence(rows, out_dir / "dark_subtraction_convergence.png", has_interp)
+    _plot_convergence(rows, out_dir / "dark_subtraction_convergence.png", has_interp,
+                      master_hp=master_hp)
 
     print(f"\nTotal time: {format_duration(time.monotonic() - t0)}")
     print(f"Outputs in {out_dir.resolve()}")

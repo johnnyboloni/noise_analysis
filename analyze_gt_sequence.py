@@ -328,7 +328,7 @@ CROP_XY   = (1500, 1800)  # (x, y) pixel coords of the top-left corner for
                         # so a crop is literally a sub-region of its full
                         # image, directly comparable crop to crop. None or
                         # CROP_SIZE = 0 skips this.
-CROP_SIZE = 2000          # crop side length in pixels (square)
+CROP_SIZE = 500           # crop side length in pixels (square)
 SAVE_DNG        = True  # write a .dng next to every GT candidate PNG, in raw
                         # ADU with the black pedestal restored, so downstream
                         # tools read it exactly like an original capture

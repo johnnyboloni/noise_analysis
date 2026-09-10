@@ -57,9 +57,17 @@ Outputs (saved to OUTPUT_DIR/<sequence_name><RUN_SUFFIX>/):
                              ratio is confirmed well under 3x; local vs global
                              land in separate output dirs so they can be
                              compared directly)
-  - gt_defect_sigma_scan.png
-                           : flagged fraction vs threshold, for choosing
-                             HOT_PIXEL_SIGMA (only when DARK_DIR is set)
+  - gt_defect_sigma_scan.png / _excess.png
+                           : histogram of the local residual against a
+                             Gaussian reference, and flagged-count vs
+                             threshold on log-log axes -- for choosing
+                             HOT_PIXEL_SIGMA from data. The _excess plot is
+                             the actual test for a real defect population: a
+                             floor before the final drop means one exists; a
+                             smooth slope all the way down means the
+                             threshold is just cutting into a continuum, no
+                             matter how large "excess over chance" looks at
+                             any single k (only when DARK_DIR is set)
   - gt_stuck_pixel_map.png/.npy : pixels whose TEMPORAL STD across the dark
                              sequence is anomalously low relative to their
                              same-colour neighbours (stuck/dead), via
@@ -68,6 +76,11 @@ Outputs (saved to OUTPUT_DIR/<sequence_name><RUN_SUFFIX>/):
                              pixels with a normal mean that never fluctuate,
                              invisible to the level-based map (only when
                              DARK_DIR is set)
+  - gt_stuck_pixel_sigma_scan.png / _excess.png
+                           : same pair as gt_defect_sigma_scan, run on the
+                             temporal std map's low-noise side, for choosing
+                             STUCK_PIXEL_SIGMA from data (only when DARK_DIR
+                             is set)
   - gt_drift_*.png         : per-frame position over the run, the path it
                              traced, and the distribution of drift magnitudes,
                              from phase correlation on a Bayer sub-plane crop.
@@ -872,30 +885,41 @@ def _stuck_pixel_map(std_map, pattern, n_sigma, method='local'):
     return mask, int(mask.sum())
 
 
-def _defect_sigma_scan(dark_adu, pattern, out, current_sigma, method='local'):
+def _defect_sigma_scan(dark_adu, pattern, out, current_sigma, method='local',
+                       sided='both'):
     """
-    Show where real defects start, so HOT_PIXEL_SIGMA can be chosen from data.
+    Show where real defects start, so the threshold can be chosen from data
+    rather than guessed.
 
-    Because the threshold is now MAD-derived, k maps directly onto a
-    false-positive rate: on a Gaussian bulk, |dev| > k sigma happens to
-    erfc(k/sqrt(2)) of healthy pixels by chance. On 12.5 MP that is ~34,000
-    pixels at k=3 and about 7 at k=5, so the choice matters far more than it
-    looks.
+    Because the threshold is MAD-derived, k maps directly onto a
+    false-positive rate: on a Gaussian bulk, the chance of clearing k sigma
+    happens to erfc(k/sqrt(2)) of healthy pixels for a two-sided test (half
+    that for one-sided). On 12.5 MP that is tens of thousands of pixels at
+    k=3 but a handful by k=5, so the choice matters far more than it looks.
 
-    Real defects are the EXCESS over that expectation. The table prints both,
-    so the right k is visible rather than guessed: take the smallest k where
-    the excess still dominates the chance count, since every pixel below that
-    is a healthy pixel about to be needlessly interpolated.
+    Real defects are the EXCESS over that chance expectation -- but a table
+    over a token handful of sigma (this used to stop at k=7) can only show
+    that excess exists, not whether it is a genuine separate population or
+    just more of the same continuous tail. The real test is whether the
+    flagged count, followed out to the full range the data actually reaches,
+    FLATTENS into a floor before finally dropping to zero at the true
+    maximum (a discrete defect population -- a fixed number of genuinely
+    broken pixels, nothing past them) or just keeps sloping down with no such
+    floor (a continuum -- e.g. dark current shot noise / DSNU's own
+    physically continuous spread, which has no natural cutoff to threshold
+    at). That is what the second saved plot (<out>_excess.<ext>) shows, on
+    log-log axes so a floor is visible even though the counts span many
+    orders of magnitude.
 
-    The histogram shows the same thing continuously -- the residual in sigma
-    units against a Gaussian reference. Where the measured tail lifts off the
-    curve is where defects begin.
+    sided: 'both' (flags |residual| > k -- HOT_PIXEL_SIGMA's hot-and-cold
+    test), 'hot' (residual > k only) or 'cold' (residual < -k only --
+    STUCK_PIXEL_SIGMA's low-noise-only test). Must match what the caller's
+    detector actually thresholds, or this answers a different question than
+    the one being asked.
 
-    `method` must match whatever _defect_map is being tuned for ('local'
-    subtracts a local same-colour median first, 'global' does not) -- the
-    scan has to measure the same residual the threshold will actually be
-    applied to, or the table answers a different question than the one being
-    asked.
+    `method` must also match whatever the detector was tuned for ('local'
+    subtracts a local same-colour median first, 'global' does not) -- same
+    reasoning.
     """
     from math import erfc, sqrt as _sqrt
 
@@ -905,7 +929,7 @@ def _defect_sigma_scan(dark_adu, pattern, out, current_sigma, method='local'):
         dev = dark_adu
     else:
         raise ValueError(f"unknown defect method {method!r}; expected 'local' or 'global'")
-    z   = np.zeros_like(dev, dtype=np.float32)
+    z = np.zeros_like(dev, dtype=np.float32)
     for r in range(2):
         for c in range(2):
             v     = dev[r::2, c::2]
@@ -913,19 +937,41 @@ def _defect_sigma_scan(dark_adu, pattern, out, current_sigma, method='local'):
             sigma = 1.4826 * np.median(np.abs(v - med))
             z[r::2, c::2] = (v - med) / max(sigma, 1e-9)
 
-    npx = z.size
-    print("\n  Choosing HOT_PIXEL_SIGMA (excess over chance = likely real)")
-    print(f"    {'k':>5} {'flagged':>10} {'by chance':>11} {'excess':>10}")
-    print("    " + "-" * 38)
-    for k in (3.0, 3.5, 4.0, 4.5, 5.0, 5.5, 6.0, 7.0):
-        flagged  = int((np.abs(z) > k).sum())
-        expected = erfc(k / _sqrt(2)) * npx
+    if sided == 'both':
+        stat, chance_scale = np.abs(z), 1.0
+    elif sided == 'hot':
+        stat, chance_scale = z, 0.5
+    elif sided == 'cold':
+        stat, chance_scale = -z, 0.5
+    else:
+        raise ValueError(f"unknown sided {sided!r}; expected 'both', 'hot' or 'cold'")
+
+    npx      = stat.size
+    stat_max = float(np.nanmax(stat))
+    k_max    = max(stat_max, float(current_sigma) * 1.5, 8.0)
+
+    print(f"\n  Choosing the threshold ({sided}, excess over chance = likely real)")
+    print(f"    {'k':>7} {'flagged':>10} {'by chance':>11} {'excess':>10}")
+    print("    " + "-" * 42)
+    table_ks = sorted(set(
+        [3.0, 3.5, 4.0, 4.5, 5.0, 5.5, 6.0, 7.0, 8.0, 10.0, 15.0, 20.0,
+         round(float(current_sigma), 2), round(k_max, 1)]))
+    for k in table_ks:
+        if k > k_max + 1e-9:
+            continue
+        flagged  = int((stat > k).sum())
+        expected = chance_scale * erfc(k / _sqrt(2)) * npx
         mark = "  <- current" if abs(k - float(current_sigma)) < 1e-9 else ""
-        print(f"    {k:>5.1f} {flagged:>10,} {expected:>11,.0f} "
+        print(f"    {k:>7.2f} {flagged:>10,} {expected:>11,.0f} "
               f"{max(flagged - expected, 0):>10,.0f}{mark}")
 
+    # Histogram spans the full observed range, not a token window -- a
+    # genuinely separate defect cluster then shows as actual gaps in the
+    # bars (see mean_histogram.png), distinct from a smooth continuous decay.
     fig, ax = plt.subplots(figsize=(9, 5))
-    bins = np.linspace(-8, 12, 400)
+    hi   = max(k_max * 1.05, 12.0)
+    lo   = -hi if sided == 'cold' else -8.0
+    bins = np.linspace(lo, hi, 400)
     ax.hist(z.ravel(), bins=bins, color="steelblue", alpha=0.85,
             label="measured residual")
     centres = 0.5 * (bins[1:] + bins[:-1])
@@ -933,8 +979,8 @@ def _defect_sigma_scan(dark_adu, pattern, out, current_sigma, method='local'):
              np.exp(-centres ** 2 / 2) / np.sqrt(2 * np.pi))
     ax.plot(centres, gauss, "--", color="crimson", linewidth=1.6,
             label="Gaussian (healthy pixels)")
-    ax.axvline(float(current_sigma), color="k", linewidth=1.2,
-               label=f"current k = {current_sigma}")
+    line_k = -float(current_sigma) if sided == 'cold' else float(current_sigma)
+    ax.axvline(line_k, color="k", linewidth=1.2, label=f"current k = {current_sigma}")
     ax.set_yscale("log")
     ax.set_ylim(0.5, None)
     ax.set_xlabel("local residual, in robust sigma", fontsize=11)
@@ -947,6 +993,35 @@ def _defect_sigma_scan(dark_adu, pattern, out, current_sigma, method='local'):
     fig.savefig(out, dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"Saved {out}")
+
+    # Excess-over-chance curve: the actual test for a knee, out to the full
+    # observed range. Log-log so a floor is visible however far it sits.
+    out = Path(out)
+    ks = np.geomspace(2.0, k_max, 80)
+    flagged_curve  = np.array([int((stat > k).sum()) for k in ks], dtype=np.float64)
+    expected_curve = chance_scale * np.array([erfc(k / _sqrt(2)) for k in ks]) * npx
+
+    out_excess = out.with_name(out.stem + "_excess" + out.suffix)
+    fig, ax = plt.subplots(figsize=(9, 5))
+    ax.plot(ks, np.maximum(flagged_curve, 0.5), color="steelblue", linewidth=1.8,
+            label="flagged (measured)")
+    ax.plot(ks, np.maximum(expected_curve, 0.5), "--", color="crimson", linewidth=1.4,
+            label="expected by chance (Gaussian)")
+    ax.axvline(float(current_sigma), color="k", linewidth=1.0,
+               label=f"current k = {current_sigma}")
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    ax.set_xlabel("threshold k (robust sigma)", fontsize=11)
+    ax.set_ylabel("pixel count (log)", fontsize=11)
+    ax.set_title("Flagged population vs threshold -- a floor before the final "
+                 "drop is a real defect population; a smooth slope all the "
+                 "way down is not", fontsize=10)
+    ax.legend(fontsize=9)
+    ax.grid(True, which="both", alpha=0.3, linestyle="--")
+    fig.tight_layout()
+    fig.savefig(out_excess, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved {out_excess}")
 
 
 def _interpolate_defects(frame, pattern, mask):
@@ -1756,7 +1831,7 @@ def analyze_gt_sequence(
                       f"{DEFECT_FRAC_WARN * 100:.2f}%.")
             _defect_sigma_scan(dark_adu, pattern,
                                seq_out / "gt_defect_sigma_scan.png",
-                               HOT_PIXEL_SIGMA, method=DEFECT_METHOD)
+                               HOT_PIXEL_SIGMA, method=DEFECT_METHOD, sided='both')
             if mask.any():
                 _plot_defect_map(mask, n_hot, n_cold,
                                  seq_out / "gt_defect_map.png")
@@ -1776,6 +1851,9 @@ def analyze_gt_sequence(
             print(f"  Stuck-pixel map ({DEFECT_METHOD}, temporal std >"
                   f"{STUCK_PIXEL_SIGMA}σ below same-colour neighbours): "
                   f"{n_stuck} pixels, {stuck_mask.mean() * 100:.4f}% of pixels")
+            _defect_sigma_scan(std_map, pattern,
+                               seq_out / "gt_stuck_pixel_sigma_scan.png",
+                               STUCK_PIXEL_SIGMA, method=DEFECT_METHOD, sided='cold')
             if stuck_mask.any():
                 _plot_defect_map(stuck_mask, 0, n_stuck,
                                  seq_out / "gt_stuck_pixel_map.png",
